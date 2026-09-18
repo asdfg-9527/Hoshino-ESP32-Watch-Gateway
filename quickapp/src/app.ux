@@ -1,0 +1,5 @@
+<script>
+// The application has one page and no background work.  Keep this lifecycle
+// intentionally empty so page ownership remains explicit in wifi_setup.ux.
+export default {}
+</script>

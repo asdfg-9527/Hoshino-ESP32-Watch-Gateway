@@ -15,11 +15,14 @@
 #include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
-#include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include "sd_storage.h"
+#include "watch_secret_local.h"
+#define HOSHINO_ENABLE_ASR 0
+#if HOSHINO_ENABLE_ASR
+#include <SPIFFS.h>
 #include <opus.h>
-#include <U8g2lib.h>
-#include <Wire.h>
+#endif
 #include <BluetoothSerial.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -59,14 +62,7 @@ constexpr uint8_t kWatchQuickAppWakeAttempts = 3;
 // prefer channel 5 when advertised and only use it as a bounded fallback.
 constexpr int kWatchObservedSppChannel = 5;
 constexpr uint32_t kWatchSdpCacheMs = 30 * 60 * 1000;
-// Engineering targets inferred from the official trace and the user's observed
-// 5-10 s offline failure window. These are deliberately configurable-in-code
-// guards, not claimed Xiaomi protocol constants.
-constexpr uint32_t kXiaoAiRollingFirstAudioMs = 1200;
-constexpr uint32_t kXiaoAiRollingIntervalMs = 1600;
-constexpr uint32_t kXiaoAiNoProgressTimeoutMs = 7500;
-constexpr uint32_t kXiaoAiEndDelayMs = 350;
-constexpr uint32_t kXiaoAiContextIdleResetMs = 10 * 60 * 1000;
+constexpr uint32_t kWatchContextIdleResetMs = 10 * 60 * 1000;
 constexpr uint32_t kBenchAckTimeoutMs = 8000;
 constexpr uint32_t kBenchControlTimeoutMs = 8000;
 constexpr uint32_t kBenchControlGapMs = 150;
@@ -74,46 +70,13 @@ constexpr uint32_t kBenchPacedChunkGapMs = 25;
 constexpr uint8_t kBenchChunkRetries = 2;
 constexpr size_t kBenchChunkRawMax = 512;
 constexpr char kHoshinoQuickAppPackage[] = "com.hoshino.app";
-constexpr char kApSsid[] = "Vela-Bridge";
-constexpr uint8_t kSetupWifiScanMaxResults = 20;
-constexpr uint32_t kSetupBluetoothScanMs = 8000;
-constexpr uint8_t kSetupBluetoothScanMaxResults = 20;
-// 蓝牙 Classic SPP 本地设备名（手表侧看到的"手机"名）。
-constexpr char kBtLocalName[] = "Vela-Gateway";
-// BOOT is GPIO0. It is active-low after normal firmware startup; holding it
-// at reset still has the ESP32 ROM download-mode meaning and is not changed.
-constexpr int kSetupTriggerPin = 0;
+constexpr char kApSsid[] = "Hoshino-Bridge";
+// 配网触发 IO：短接这两个引脚（GPIO16 与 GPIO17）持续约 2 秒，即可进入配网模式。
+//   GPIO16 = 输出高电平；GPIO17 = 输入下拉。短接后 GPIO17 读到高电平即触发。
+// 这两个引脚是 UART2 的 RX/TX，本固件未使用 UART2，属于空闲引脚。
+constexpr int kSetupTriggerPinOut = 16;
+constexpr int kSetupTriggerPinIn  = 17;
 constexpr uint32_t kSetupTriggerHoldMs = 2000;
-
-// ---------- OLED 状态屏（SSD1306 128x64 I2C）----------
-// SDA=21, SCL=22（BOOT 使用 GPIO0；21/22 空闲）。
-// 全屏 framebuffer 仅 1024 字节，对紧张的堆影响可忽略；不开新任务，
-// 直接在 loop() 里定时刷新，只读现有状态变量。
-constexpr int kOledSdaPin = 21;
-constexpr int kOledSclPin = 22;
-constexpr uint8_t kOledI2cAddr = 0x3C;
-constexpr uint32_t kDisplayRefreshMs = 250;
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, kOledSclPin, kOledSdaPin);
-bool gDisplayReady = false;
-bool gDisplayInitDeferred = false;
-uint32_t gLastDisplayMs = 0;
-
-// ---------- 心跳 LED（板载 D2 = GPIO2 = LED_BUILTIN）----------
-// 在 loop() 里按桥接状态以不同频率翻转，既指示主循环存活，也反映当前状态。
-#if defined(LED_BUILTIN)
-constexpr int kHeartbeatLedPin = LED_BUILTIN;
-#else
-constexpr int kHeartbeatLedPin = 2;  // uPesy WROOM: GPIO2 (丝印 D2)
-#endif
-bool gLedOn = false;
-uint32_t gLastLedMs = 0;
-
-// 显示函数定义在状态变量之后（见文件后部），那里 gSetupMode /
-// gWatchBridgeState / 网络计数器等均已声明。
-void initDisplay();
-void renderDisplay();
-void serviceHeartbeatLed();
-
 constexpr uint8_t kSppV1VersionRequest[] = {
     0xba, 0xdc, 0xfe, 0x00, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x00, 0xef,
 };
@@ -132,18 +95,8 @@ constexpr uint8_t kSppV2SessionStartRequest[] = {
 
 WebServer server(kPort);
 Preferences prefs;
+hoshino::SdStorageService sdStorage;  // Dedicated HSPI host on SCK18/MISO19/MOSI23/CS5; mounted only on demand.
 BluetoothSerial watchBt;
-struct SetupBluetoothDevice {
-  char name[49]{};
-  char address[18]{};
-  int rssi = 0;
-  uint32_t cod = 0;
-};
-static SetupBluetoothDevice gSetupBluetoothResults[kSetupBluetoothScanMaxResults]{};
-static volatile bool gSetupBluetoothScanRunning = false;
-static volatile bool gSetupBluetoothScanReady = false;
-static volatile bool gSetupBluetoothScanFailed = false;
-static volatile uint8_t gSetupBluetoothResultCount = 0;
 constexpr size_t kWatchRxQueueBytes = 4 * 1024;
 QueueHandle_t watchRxQueue = nullptr;
 volatile uint32_t watchRxDroppedBytes = 0;
@@ -158,11 +111,12 @@ static int gWatchResolvedSppChannel = 0;
 static uint32_t gWatchSdpResolvedMs = 0;
 static char gWatchSdpSource[24] = "unresolved";
 static char gWatchSdpAddress[18]{};
-String ssid, wifiPass, baseUrl, apiKey, model, asrModel, asrLanguage, localToken, caPem, apPassword, watchMac, watchAuthKey;
+String ssid, wifiPass, baseUrl, apiKey, model, localToken, caPem, apPassword, watchMac, watchAuthKey;
 bool allowInsecureTls = false;
+bool autoConnectWatch = false;
+#if HOSHINO_ENABLE_ASR
 bool serialAudioExport = false;
 bool nativeXiaoAiReturn = true;
-bool autoConnectWatch = false;
 bool chatAfterAsr = true;
 bool captureChannel8 = false;
 volatile bool gXiaoAiEndPending = false;
@@ -180,23 +134,46 @@ volatile uint32_t gXiaoAiFinalPendingSessionId = 0;
 volatile bool gXiaoAiAwaitAssistant = false;
 volatile uint32_t gXiaoAiAssistantDoneSessionId = 0;
 volatile uint32_t gXiaoAiPartialSentCount = 0;
+#endif
 bool gWatchAutoReconnectSuppressed = false;
 uint32_t gNextWatchAutoConnectMs = 0;
 bool gMdnsStarted = false;
 // 配网模式状态：true 时板子处于 SoftAP 配网模式（HTTP 服务器从 AP 提供服务）。
 bool gSetupMode = false;
-// HTTP 服务器是否已启动（配网模式或 STA 连接后都会置位）。
+// HTTP 服务器是否已启动（配网模式、SoftAP 或 STA 连接后都会置位）。
 bool gServerStarted = false;
+// SoftAP can be the only usable interface while home Wi-Fi is empty/down.
+volatile bool gSoftApActive = false;
+// A STA connect is started asynchronously during the Round-4 hold.  Keep an
+// explicit operation marker so the watch setup scan never asks the Wi-Fi
+// driver to scan while esp_wifi_connect() is still negotiating.
+volatile bool gWifiStaConnecting = false;
+volatile uint32_t gWifiStaConnectDeadlineMs = 0;
+volatile bool gWifiStaStopReconnectPending = false;
+volatile uint32_t gWifiStaFailureBackoffUntilMs = 0;
+volatile uint8_t gWifiStaLastReason = 0;
+char gWifiState[24] = "idle";
+char gWifiError[32] = "";
+String gPendingWifiSsid;
+String gPendingWifiPassword;
+volatile bool gWifiProvisioningPending = false;
+constexpr uint32_t kWifiStaConnectTimeoutMs = 15000;
+constexpr uint32_t kWifiStaFailureBackoffMs = 1500;
 int maxTokens = 512;
 volatile bool gWatchBridgeRunning = false;
 volatile bool gWatchBridgeStopRequested = false;
 TaskHandle_t gWatchBridgeTask = nullptr;
+#if HOSHINO_ENABLE_ASR
 TaskHandle_t gWatchAsrTask = nullptr;
+#endif
 SemaphoreHandle_t gBridgeStateMutex = nullptr;
+#if HOSHINO_ENABLE_ASR
 char gLastAsrTranscript[768]{};
 char gLastAsrError[192]{};
+#endif
 char gLastAiAnswer[768]{};
 char gWatchBridgeState[64] = "idle";
+#if HOSHINO_ENABLE_ASR
 char gXiaoAiLastPartial[768]{};
 char gXiaoAiFinalPacketPath[48]{};
 char gXiaoAiFinalWavPath[48]{};
@@ -217,6 +194,7 @@ struct AsrJobContext {
   char packetPath[48]{};
   char wavPath[48]{};
 };
+#endif
 
 struct WatchConversationTurn {
   char user[384]{};
@@ -228,7 +206,9 @@ size_t gWatchContextCount = 0;
 size_t gWatchContextNext = 0;
 uint32_t gWatchContextLastMs = 0;
 
+#if HOSHINO_ENABLE_ASR
 bool scheduleWatchAsrJob(const char* packetPath, const char* wavPath, bool finalResult, uint32_t sessionId);
+#endif
 bool parseWatchAddress(const String& value, uint8_t output[6]);
 void authenticateWatchSpp(String target, String secretText);
 void setWatchBridgeState(const char* state);
@@ -239,6 +219,11 @@ void connectWifi();
 void enterSetupMode();
 void setupTriggerPins();
 bool setupTriggered();
+void beginWifiStaConnection(uint32_t timeoutMs);
+void serviceWifiStaConnectionState(bool cancelled = false);
+void clearWifiStaConnection(const char* reason);
+void handleWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+void finishPendingWifiProvisioning(bool connected);
 constexpr size_t kFetchTraceEntries = 8;
 String fetchTrace[kFetchTraceEntries];
 size_t fetchTraceNext = 0;
@@ -419,7 +404,7 @@ void probeWatchSdp(String target) {
     Serial.println("WATCH_SDP_INVALID_ADDRESS");
     return;
   }
-  if (!beginWatchBluetooth(kBtLocalName)) {
+  if (!beginWatchBluetooth("Hoshino-Bridge-SDP")) {
     Serial.println("WATCH_SDP_BT_INIT_FAILED");
     return;
   }
@@ -479,60 +464,6 @@ String serialSafeName(const std::string& value) {
   return safe.isEmpty() ? "unnamed" : safe;
 }
 
-static void setupBluetoothScanTask(void*) {
-  memset(gSetupBluetoothResults, 0, sizeof(gSetupBluetoothResults));
-  gSetupBluetoothResultCount = 0;
-  gSetupBluetoothScanFailed = false;
-
-  if (!gSetupMode || !beginWatchBluetooth("Vela-Setup-Scan")) {
-    gSetupBluetoothScanFailed = true;
-  } else {
-    BTScanResults* results = watchBt.discover(kSetupBluetoothScanMs);
-    if (!results) {
-      gSetupBluetoothScanFailed = true;
-    } else {
-      for (int i = 0; i < results->getCount() &&
-                      gSetupBluetoothResultCount < kSetupBluetoothScanMaxResults; ++i) {
-        BTAdvertisedDevice* device = results->getDevice(i);
-        if (!device) continue;
-        SetupBluetoothDevice& target =
-            gSetupBluetoothResults[gSetupBluetoothResultCount];
-        const String name = serialSafeName(device->getName());
-        String address = String(device->getAddress().toString().c_str());
-        address.toUpperCase();
-        snprintf(target.name, sizeof(target.name), "%s", name.c_str());
-        snprintf(target.address, sizeof(target.address), "%s", address.c_str());
-        target.rssi = device->getRSSI();
-        target.cod = static_cast<uint32_t>(device->getCOD());
-        ++gSetupBluetoothResultCount;
-      }
-      watchBt.discoverClear();
-    }
-    watchBt.end();
-  }
-
-  gSetupBluetoothScanReady = true;
-  gSetupBluetoothScanRunning = false;
-  Serial.printf("SETUP_BT_SCAN_COMPLETE ok=%s devices=%u\n",
-                gSetupBluetoothScanFailed ? "false" : "true",
-                static_cast<unsigned>(gSetupBluetoothResultCount));
-  vTaskDelete(nullptr);
-}
-
-bool startSetupBluetoothScan() {
-  if (!gSetupMode || gSetupBluetoothScanRunning || gWatchBridgeRunning) return false;
-  gSetupBluetoothScanReady = false;
-  gSetupBluetoothScanFailed = false;
-  gSetupBluetoothScanRunning = true;
-  const BaseType_t created = xTaskCreatePinnedToCore(
-      setupBluetoothScanTask, "setup_bt_scan", 6144, nullptr, 1, nullptr, 1);
-  if (created == pdPASS) return true;
-  gSetupBluetoothScanRunning = false;
-  gSetupBluetoothScanFailed = true;
-  gSetupBluetoothScanReady = true;
-  return false;
-}
-
 void probeWatchClassic(String target) {
   target.trim();
   target.toUpperCase();
@@ -540,7 +471,7 @@ void probeWatchClassic(String target) {
     Serial.println("WATCH_PROBE_INVALID_ADDRESS");
     return;
   }
-  if (!beginWatchBluetooth(kBtLocalName)) {
+  if (!beginWatchBluetooth("Hoshino-Bridge-Probe")) {
     Serial.println("WATCH_PROBE_BT_INIT_FAILED");
     return;
   }
@@ -575,7 +506,7 @@ void connectWatchSpp(String target) {
     Serial.println("WATCH_SPP_INVALID_ADDRESS");
     return;
   }
-  if (!beginWatchBluetooth(kBtLocalName)) {
+  if (!beginWatchBluetooth("Hoshino-Bridge-Probe")) {
     Serial.println("WATCH_SPP_BT_INIT_FAILED");
     return;
   }
@@ -599,7 +530,7 @@ void connectWatchSppChannel(String target, int channel) {
     Serial.println("WATCH_SPP_CHANNEL_INVALID_INPUT");
     return;
   }
-  if (!beginWatchBluetooth(kBtLocalName)) {
+  if (!beginWatchBluetooth("Hoshino-Bridge-Probe")) {
     Serial.println("WATCH_SPP_CHANNEL_BT_INIT_FAILED");
     return;
   }
@@ -649,7 +580,7 @@ void probeWatchSppVersion(String target) {
     Serial.println("WATCH_VERSION_INVALID_ADDRESS");
     return;
   }
-  if (!beginWatchBluetooth(kBtLocalName)) {
+  if (!beginWatchBluetooth("Hoshino-Bridge-Probe")) {
     Serial.println("WATCH_VERSION_BT_INIT_FAILED");
     return;
   }
@@ -677,7 +608,7 @@ void probeWatchSppSession(String target) {
     Serial.println("WATCH_SESSION_INVALID_ADDRESS");
     return;
   }
-  if (!beginWatchBluetooth(kBtLocalName)) {
+  if (!beginWatchBluetooth("Hoshino-Bridge-Probe")) {
     Serial.println("WATCH_SESSION_BT_INIT_FAILED");
     return;
   }
@@ -736,159 +667,7 @@ static volatile uint32_t gWatchNetworkRxPackets = 0;
 static volatile uint32_t gWatchNetworkTxPackets = 0;
 static volatile uint32_t gWatchNetworkDroppedPackets = 0;
 static volatile err_t gWatchNetworkInitResult = ERR_INPROGRESS;
-
-// Wi-Fi is intentionally started only after the timing-critical Watch bootstrap.
-// The old fork fired WiFi.begin() once and then never verified that a usable
-// STA default route actually appeared. On a memory-tight WROOM, a failed or
-// incomplete first Wi-Fi init therefore left DHCP working on the watch while
-// every Internet packet had nowhere to go. Keep a tiny post-bootstrap uplink
-// state machine: retry STA association and, once an IPv4 gateway exists, make
-// that STA netif the default route and re-arm NAPT on the watch netif.
-static volatile bool gWatchInternetRouteReady = false;
-static volatile bool gWatchInternetRouteRepairPending = false;
-static uint32_t gWatchLastWifiBeginMs = 0;
-static int gWatchLastWifiStatus = -999;
-constexpr uint32_t kWatchWifiRetryMs = 12000;
-
-// ---------- OLED 渲染（状态变量均已在上方声明）----------
-
-// 取一个简短、适合屏幕宽度的桥接状态文案。
-const char* displayStateLabel(const char* state) {
-  if (!state || !*state) return "idle";
-  if (!strcmp(state, "connected")) return "CONNECTED";
-  if (!strcmp(state, "connecting") || !strcmp(state, "starting")) return "connecting";
-  if (!strcmp(state, "stopping")) return "stopping";
-  if (!strcmp(state, "idle")) return "idle";
-  if (!strcmp(state, "task_create_failed")) return "task FAIL";
-  return state;  // 其它状态原样显示（已较短）
-}
-
-// 渲染一帧。无堆分配，所有文案为栈上/字面量。
-void renderDisplay() {
-  if (!gDisplayReady) return;
-  // 加锁快照桥接状态，避免读到半更新字符串（不经过 String，无堆分配）。
-  char stateSnap[sizeof(gWatchBridgeState)]{};
-  if (gBridgeStateMutex && xSemaphoreTake(gBridgeStateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    memcpy(stateSnap, gWatchBridgeState, sizeof(stateSnap));
-    xSemaphoreGive(gBridgeStateMutex);
-  } else {
-    memcpy(stateSnap, gWatchBridgeState, sizeof(stateSnap));
-  }
-
-  // 每帧先清空 framebuffer，否则上一帧的旧像素会和新文字叠在一起造成花屏。
-  display.clearBuffer();
-
-  // 四行版式（全屏 128x64，6x10 字体，行间距约 16px）：
-  //   IP:[IP地址]
-  //   TX: n RX: n
-  //   F-RAM: n KB
-  //   I：(当前状态)
-  display.setFont(u8g2_font_6x10_tr);
-  const char* stateLabel = displayStateLabel(stateSnap);
-  char buf[48];
-
-  // 第 1 行：IP（配网模式显示 AP IP 192.168.4.1）
-  // 直接从 IPAddress 的 4 个字节格式化，避免每次刷新都 new 一个 String ——
-  // 那会在 BT 认证→启动 WiFi 的窗口里（loopTask 与桥接任务同在 core 1）
-  // 反复申请/释放小块，把堆切碎，导致 esp_wifi_init 因最大连续块不足而 257。
-  IPAddress ip = gSetupMode ? WiFi.softAPIP()
-                            : (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress(0, 0, 0, 0));
-  snprintf(buf, sizeof(buf), "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-  display.drawStr(2, 14, buf);
-
-  // 第 2 行：网络包计数 TX/RX（NAPT 转发活跃度）
-  snprintf(buf, sizeof(buf), "TX %lu RX %lu",
-           static_cast<unsigned long>(gWatchNetworkTxPackets),
-           static_cast<unsigned long>(gWatchNetworkRxPackets));
-  display.drawStr(2, 30, buf);
-
-  // 第 3 行：空闲 RAM
-  snprintf(buf, sizeof(buf), "F-RAM %luKB",
-           static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
-  display.drawStr(2, 46, buf);
-
-  // 第 4 行：当前状态（配网/桥接状态），直接显示文本。
-  if (gSetupMode) {
-    snprintf(buf, sizeof(buf), "Setup connect AP");
-  } else if (WiFi.status() != WL_CONNECTED) {
-    snprintf(buf, sizeof(buf), "WiFi disc. %s", stateLabel);
-  } else {
-    snprintf(buf, sizeof(buf), "%s", stateLabel);
-  }
-  display.drawStr(2, 62, buf);
-
-  display.sendBuffer();
-}
-
-void initDisplay() {
-  // 指定 I2C 引脚后初始化 U8g2 硬件 I2C。
-  Wire.begin(kOledSdaPin, kOledSclPin);
-
-  // 先扫描 I2C 总线，把找到的设备地址打到串口，方便排查地址/接线。
-  // 0x7B(8位读) 对应 7 位地址 0x3D；SSD1306 常见为 0x3C 或 0x3D。
-  uint8_t found7 = 0;
-  Serial.printf("DISPLAY_I2C_SCAN sda=%d scl=%d:", kOledSdaPin, kOledSclPin);
-  for (uint8_t addr = 0x03; addr <= 0x77; ++addr) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      Serial.printf(" 0x%02X", addr);
-      if (found7 == 0) found7 = addr;
-    }
-  }
-  Serial.println();
-
-  // 优先用配置地址，否则用扫描到的第一个地址。
-  uint8_t addr7 = kOledI2cAddr;
-  if (found7 == 0) {
-    Serial.printf("DISPLAY_INIT_FAILED no I2C device on SDA=%d SCL=%d (check VCC/GND/SDA/SCL)\n",
-                  kOledSdaPin, kOledSclPin);
-    return;
-  }
-  if (found7 != kOledI2cAddr) {
-    Serial.printf("DISPLAY_ADDR_OVERRIDE configured=0x%02X but using scanned=0x%02X\n",
-                  kOledI2cAddr, found7);
-    addr7 = found7;
-  }
-
-  display.setI2CAddress(addr7 << 1);
-  if (display.begin()) {
-    gDisplayReady = true;
-    display.clearBuffer();
-    display.setFont(u8g2_font_6x10_tr);
-    display.drawStr(2, 30, "VelaGateway");
-    display.drawStr(2, 46, "Init...");
-    display.sendBuffer();
-    Serial.printf("DISPLAY_READY addr=0x%02X\n", addr7);
-  } else {
-    Serial.printf("DISPLAY_INIT_FAILED SSD1306 not responding at 0x%02X (check module model)\n", addr7);
-  }
-}
-
-// 心跳 LED：在 loop() 里调用，按当前阶段以不同节奏翻转板载 D2。
-// 任何状态都在闪烁——常灭/常亮即说明 loop() 卡死；节奏越快表示越忙。
-//   已连接+联网：慢闪（空闲存活）；连接中：快闪；配网/idle：常规闪。
-void serviceHeartbeatLed() {
-  uint32_t toggleMs;
-  if (gSetupMode) {
-    toggleMs = 400;                           // 配网 AP：常规闪
-  } else if (gWatchBridgeState &&
-             (strcmp(gWatchBridgeState, "connecting") == 0 ||
-              strcmp(gWatchBridgeState, "starting") == 0)) {
-    toggleMs = 80;                            // 连接中：快闪
-  } else if (gWatchBridgeState &&
-             strcmp(gWatchBridgeState, "connected") == 0 &&
-             WiFi.status() == WL_CONNECTED) {
-    toggleMs = 1000;                          // 已连接+联网：慢闪（存活心跳）
-  } else {
-    toggleMs = 300;                           // idle/其它：常规闪
-  }
-  if (static_cast<int32_t>(millis() - gLastLedMs) >= static_cast<int32_t>(toggleMs)) {
-    gLastLedMs = millis();
-    gLedOn = !gLedOn;
-    digitalWrite(kHeartbeatLedPin, gLedOn ? HIGH : LOW);
-  }
-}
-
+#if HOSHINO_ENABLE_ASR
 constexpr size_t kWatchStreamPacketMax = 512;
 constexpr size_t kWatchStreamPacketCountMax = 256;
 constexpr char kWatchStreamCapturePath[] = "/watch_stream.packets";
@@ -1139,6 +918,7 @@ void handleWatchStreamData(const uint8_t* data, size_t length) {
   }
   if (type == 4) emitWatchStreamCapture();
 }
+#endif  // HOSHINO_ENABLE_ASR
 
 // Xiaomi SPPv2 uses an 8-bit transport sequence. The real-device failure
 // pattern is consistent with an already-used sequence being transport-ACKed
@@ -1327,90 +1107,7 @@ void setupWatchNetworkProxyInTcpip(void*) {
   if (gWatchNetworkInitDone) xSemaphoreGive(gWatchNetworkInitDone);
 }
 
-void repairWatchInternetRouteInTcpip(void*) {
-  struct netif* sta = nullptr;
-  for (struct netif* n = netif_list; n != nullptr; n = n->next) {
-    if (n == gWatchNetworkNetif) continue;
-    if (!netif_is_up(n) || !netif_is_link_up(n)) continue;
-    const ip4_addr_t* ip = netif_ip4_addr(n);
-    const ip4_addr_t* gw = netif_ip4_gw(n);
-    if (!ip || !gw || ip4_addr_isany_val(*ip) || ip4_addr_isany_val(*gw)) continue;
-    // SoftAP has no upstream gateway; the first up netif with both an IPv4
-    // address and a non-zero gateway is the Wi-Fi STA uplink we want.
-    sta = n;
-    break;
-  }
-
-  if (sta != nullptr) {
-    if (::netif_default != sta) netif_set_default(sta);
-    if (gWatchNetworkNetif && netif_is_up(gWatchNetworkNetif)) {
-      // Re-enable NAPT after STA comes up. This is idempotent and also repairs
-      // cases where the early NAPT setup happened before an uplink existed.
-      ip_napt_enable(ip4_addr_get_u32(netif_ip4_addr(gWatchNetworkNetif)), 1);
-    }
-    gWatchInternetRouteReady = true;
-    Serial.printf("WATCH_INET_ROUTE_READY sta=%c%c ip=%d.%d.%d.%d gw=%d.%d.%d.%d default=%c%c napt=true\n",
-                  sta->name[0], sta->name[1],
-                  ip4_addr1(netif_ip4_addr(sta)), ip4_addr2(netif_ip4_addr(sta)),
-                  ip4_addr3(netif_ip4_addr(sta)), ip4_addr4(netif_ip4_addr(sta)),
-                  ip4_addr1(netif_ip4_gw(sta)), ip4_addr2(netif_ip4_gw(sta)),
-                  ip4_addr3(netif_ip4_gw(sta)), ip4_addr4(netif_ip4_gw(sta)),
-                  ::netif_default ? ::netif_default->name[0] : '?',
-                  ::netif_default ? ::netif_default->name[1] : '?');
-  } else {
-    gWatchInternetRouteReady = false;
-    Serial.println("WATCH_INET_ROUTE_MISSING reason=no_sta_ipv4_gateway");
-  }
-  gWatchInternetRouteRepairPending = false;
-}
-
-void requestWatchInternetRouteRepair() {
-  if (gWatchInternetRouteRepairPending || gWatchInternetRouteReady) return;
-  gWatchInternetRouteRepairPending = true;
-  const err_t result = tcpip_callback(repairWatchInternetRouteInTcpip, nullptr);
-  if (result != ERR_OK) {
-    gWatchInternetRouteRepairPending = false;
-    Serial.printf("WATCH_INET_ROUTE_CALLBACK_FAILED err=%d\n", static_cast<int>(result));
-  }
-}
-
-void serviceWatchInternetUplink() {
-  if (ssid.isEmpty()) return;
-  const int status = static_cast<int>(WiFi.status());
-  if (status != gWatchLastWifiStatus) {
-    gWatchLastWifiStatus = status;
-    Serial.printf("WATCH_WIFI_STATUS status=%d ip=%s free=%lu largest=%lu\n",
-                  status, WiFi.localIP().toString().c_str(),
-                  static_cast<unsigned long>(ESP.getFreeHeap()),
-                  static_cast<unsigned long>(ESP.getMaxAllocHeap()));
-  }
-
-  if (status == static_cast<int>(WL_CONNECTED)) {
-    requestWatchInternetRouteRepair();
-    return;
-  }
-
-  gWatchInternetRouteReady = false;
-  const uint32_t now = millis();
-  if (gWatchLastWifiBeginMs != 0 &&
-      static_cast<uint32_t>(now - gWatchLastWifiBeginMs) < kWatchWifiRetryMs) return;
-
-  Serial.printf("WATCH_WIFI_RETRY status=%d free=%lu largest=%lu\n",
-                status,
-                static_cast<unsigned long>(ESP.getFreeHeap()),
-                static_cast<unsigned long>(ESP.getMaxAllocHeap()));
-  WiFi.persistent(false);
-  WiFi.setAutoReconnect(true);
-  // Do not erase credentials from NVS; simply restart STA association.
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), wifiPass.c_str());
-  gWatchLastWifiBeginMs = now;
-}
-
 bool setupWatchNetworkProxy() {
-  gWatchInternetRouteReady = false;
-  gWatchInternetRouteRepairPending = false;
   if (gWatchNetworkReady) return true;
   if (!gWatchNetworkNetif) gWatchNetworkNetif = static_cast<struct netif*>(calloc(1, sizeof(struct netif)));
   if (!gWatchNetworkTxEnqueueScratch) gWatchNetworkTxEnqueueScratch = static_cast<WatchNetworkPacket*>(calloc(1, sizeof(WatchNetworkPacket)));
@@ -1600,8 +1297,9 @@ bool readSppV2Frame(SppV2Frame& output, uint32_t timeoutMs) {
   return false;
 }
 
-// The SPP Hello has a small plaintext response that is not an SPPv2 frame.
-// Drain it with strict bounds before the SPPv2 assembler starts consuming data.
+// A Xiaomi SPP peer expects this plaintext handshake before the SPPv2 start
+// request.  Its response is not an SPPv2 frame, so discard only a small,
+// bounded response window before resetting the SPPv2 assembler.
 bool startSppV2Session(const char* label) {
   if (watchBt.write(kSppHello, sizeof(kSppHello)) != sizeof(kSppHello)) {
     Serial.printf("%s_SPP_HELLO_WRITE_FAILED\n", label);
@@ -1860,7 +1558,8 @@ bool buildSyncNetworkStatus(uint8_t* output, size_t capacity, size_t& outputLeng
   return true;
 }
 
-// --- vNext: native XiaoAI transcript and channel-7 DHCP emulation ---
+#if HOSHINO_ENABLE_ASR
+// --- Native XiaoAI transcript support (disabled in Interconnect builds) ---
 bool buildXiaoAiTranscript(const char* text, bool finalResult, uint32_t eventCode,
                            uint8_t* output, size_t capacity, size_t& outputLength) {
   if (!text) text = "";
@@ -1928,6 +1627,7 @@ bool buildXiaoAiState(uint32_t state, uint8_t* output, size_t capacity, size_t& 
   outputLength = commandWriter.length();
   return true;
 }
+#endif  // HOSHINO_ENABLE_ASR
 
 uint16_t ipv4HeaderChecksum(const uint8_t* bytes, size_t length) {
   uint32_t sum = 0;
@@ -2030,6 +1730,7 @@ bool handleWatchDhcp(const uint8_t* bytes, size_t length, uint8_t& sequence) {
   return false;
 }
 
+#if HOSHINO_ENABLE_ASR
 bool sendPendingXiaoAiStart(uint8_t& sequence, const uint8_t encKey[16]) {
   if (!gXiaoAiStartPending || !nativeXiaoAiReturn) return true;
   gXiaoAiStartPending = false;
@@ -2199,6 +1900,7 @@ void drainAsrResultToWatch(uint8_t& sequence, const uint8_t encKey[16]) {
     }
   }
 }
+#endif  // HOSHINO_ENABLE_ASR
 
 struct WatchAppInfo {
   uint8_t fingerprint[64]{};
@@ -2433,9 +2135,11 @@ bool deriveCapturedSessionKeysOnly(const uint8_t secret[16],
   return ok;
 }
 
-// Compatibility path from the published Hoshino Round-4 implementation.
-// It is used only when the current AuthKey authenticates the captured record;
-// callers must retain a fresh DeviceInfo fallback for every other watch/key.
+
+// Decrypt the exact AuthStep3 DeviceInfo from the CURRENT Xiaomi 17 Pro
+// Round-4 21:01:20 successful session.
+// Captured Step3 field2 is 32 bytes = 28-byte CCM plaintext + 4-byte tag.
+// The long-term Auth Key never leaves RAM and is never printed.
 bool decryptRound4CapturedAuthDeviceInfo(const uint8_t secret[16],
                                          uint8_t output[48],
                                          size_t& outputLength) {
@@ -2454,9 +2158,13 @@ bool decryptRound4CapturedAuthDeviceInfo(const uint8_t secret[16],
   uint8_t capturedDecKey[16]{};
   uint8_t capturedEncKey[16]{};
   uint8_t nonce[12]{};
+
   bool ok = deriveCapturedSessionKeysOnly(secret, kPhoneNonce, kWatchNonce, kWatchHmac,
                                           capturedDecKey, capturedEncKey);
   if (ok) {
+    // Xiaomi AuthStep3 CCM nonce = expansion[36:40] || 8 zero bytes.
+    // deriveCapturedSessionKeysOnly returns encKey=expansion[16:32], so derive
+    // the complete expansion again only for the 4-byte CCM nonce suffix.
     uint8_t transcript[32]{};
     uint8_t hmacKey[32]{};
     uint8_t expansion[64]{};
@@ -2486,31 +2194,110 @@ bool decryptRound4CapturedAuthDeviceInfo(const uint8_t secret[16],
   if (ok) {
     mbedtls_ccm_context ccm;
     mbedtls_ccm_init(&ccm);
-    const int setKeyResult = mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, capturedEncKey, 128);
-    const int decryptResult = setKeyResult == 0
-        ? mbedtls_ccm_auth_decrypt(&ccm, kPlainLength, nonce, sizeof(nonce), nullptr, 0,
-                                   kEncryptedInfoAndTag, output,
-                                   kEncryptedInfoAndTag + kPlainLength, 4)
-        : -1;
+    const int setKeyResult =
+        mbedtls_ccm_setkey(&ccm, MBEDTLS_CIPHER_ID_AES, capturedEncKey, 128);
+    const int decryptResult =
+        setKeyResult == 0
+            ? mbedtls_ccm_auth_decrypt(&ccm,
+                                       kPlainLength,
+                                       nonce, sizeof(nonce),
+                                       nullptr, 0,
+                                       kEncryptedInfoAndTag,
+                                       output,
+                                       kEncryptedInfoAndTag + kPlainLength, 4)
+            : -1;
     mbedtls_ccm_free(&ccm);
     ok = decryptResult == 0;
   }
 
   if (ok) {
     outputLength = kPlainLength;
+    // Expected protobuf starts with field1(varint) then field2(fixed32).
     ok = outputLength >= 7 && output[0] == 0x08 && output[2] == 0x15;
   }
   if (!ok) {
     outputLength = 0;
     mbedtls_platform_zeroize(output, 48);
   }
+
   mbedtls_platform_zeroize(capturedDecKey, sizeof(capturedDecKey));
   mbedtls_platform_zeroize(capturedEncKey, sizeof(capturedEncKey));
   mbedtls_platform_zeroize(nonce, sizeof(nonce));
   return ok;
 }
 
-// Verified Round-4 CompanionDevice protobuf plaintext.  This is never sent
+bool protoFixed32Field(const uint8_t* data, size_t length,
+                       uint32_t wantedField, uint32_t& value) {
+  size_t cursor = 0;
+  while (cursor < length) {
+    uint32_t tag = 0;
+    if (!readProtoVarint(data, length, cursor, tag)) return false;
+    const uint32_t field = tag >> 3;
+    const uint32_t wire = tag & 7u;
+    if (wire == 5) {
+      if (length - cursor < 4) return false;
+      if (field == wantedField) {
+        value = static_cast<uint32_t>(data[cursor]) |
+                (static_cast<uint32_t>(data[cursor + 1]) << 8) |
+                (static_cast<uint32_t>(data[cursor + 2]) << 16) |
+                (static_cast<uint32_t>(data[cursor + 3]) << 24);
+        return true;
+      }
+      cursor += 4;
+    } else if (wire == 0) {
+      uint32_t ignored = 0;
+      if (!readProtoVarint(data, length, cursor, ignored)) return false;
+    } else if (wire == 2) {
+      uint32_t n = 0;
+      if (!readProtoVarint(data, length, cursor, n) || n > length - cursor) return false;
+      cursor += n;
+    } else if (wire == 1) {
+      if (length - cursor < 8) return false;
+      cursor += 8;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
+void logRound4AuthDeviceInfo(const uint8_t* info, size_t length) {
+  uint32_t platform = 0, unknown4 = 0, apiBits = 0;
+  const uint8_t* phoneName = nullptr;
+  const uint8_t* region = nullptr;
+  size_t phoneNameLength = 0, regionLength = 0;
+  protoVarintField(info, length, 1, platform);
+  protoFixed32Field(info, length, 2, apiBits);
+  protoBytesField(info, length, 3, phoneName, phoneNameLength);
+  protoVarintField(info, length, 4, unknown4);
+  protoBytesField(info, length, 5, region, regionLength);
+
+  float apiLevel = 0.0f;
+  static_assert(sizeof(apiLevel) == sizeof(apiBits), "float must be 32-bit");
+  memcpy(&apiLevel, &apiBits, sizeof(apiLevel));
+
+  Serial.printf("WATCH_R4_AUTH_IDENTITY len=%u platform=%lu api=%.3f unknown4=%lu phoneName=",
+                static_cast<unsigned>(length),
+                static_cast<unsigned long>(platform),
+                static_cast<double>(apiLevel),
+                static_cast<unsigned long>(unknown4));
+  if (phoneName) {
+    for (size_t i = 0; i < phoneNameLength; ++i) Serial.write(phoneName[i]);
+  } else {
+    Serial.print("<missing>");
+  }
+  Serial.print(" region=");
+  if (region) {
+    for (size_t i = 0; i < regionLength; ++i) Serial.write(region[i]);
+  } else {
+    Serial.print("<missing>");
+  }
+  Serial.print(" hex=");
+  for (size_t i = 0; i < length; ++i) Serial.printf("%02X", info[i]);
+  Serial.println();
+}
+
+// Verified Round-4 CompanionDevice protobuf plaintext. This is never sent
 // directly: buildStep3() AES-CCM encrypts it with the keys and nonce derived
 // from the current watch AuthKey and current authentication session.
 static constexpr uint8_t kRound4CompatibleDeviceInfo[] = {
@@ -3608,7 +3395,7 @@ void authenticateWatchSpp(String target, String secretText) {
     Serial.println(authenticated ? "WATCH_AUTH_OK" : "WATCH_AUTH_RESPONSE_TIMEOUT");
     if (!authenticated) break;
 
-    Serial.println("WATCH_HOLD_CONNECTED private_capture_local_only=true");
+    Serial.println("WATCH_HOLD_CONNECTED runtime_session=true");
     setWatchBridgeState("connected");
     const bool networkProxyReady = gWatchRawTraceEnabled ? false : setupWatchNetworkProxy();
     if (gWatchRawTraceEnabled) Serial.println("WATCH_NETWORK_PROXY_SKIPPED raw_trace=true");
@@ -3637,9 +3424,9 @@ void authenticateWatchSpp(String target, String secretText) {
     // and no 137-byte local array on the 6144-byte watch task stack.
     uint8_t* round4Type23 = gRawCommandPayloadScratch;
     constexpr size_t kRound4Type23Length = 137;
-    // 这条 137 字节配置 blob 是用原作者抓包会话密钥加密的，非匹配 Auth Key 解不开。
-    // 它只是认证后的一条配置消息，不参与 HMAC/身份校验；解不开就跳过发送，
-    // 其余 bootstrap 消息（ch8/2、网络状态、8/52 等都是硬编码明文）照常进行。
+    // This captured 23/3 blob is bound to the original capture session/key.
+    // It is not part of HMAC identity authentication, so a key mismatch here
+    // must not tear down an otherwise authenticated live watch session.
     bool haveType23 = round4Type23 && decryptRound4Type23Template(secret, round4Type23);
     if (haveType23) {
       Serial.printf("WATCH_ROUND4_TEMPLATE_DECRYPT_OK type23_len=%u free=%lu largest=%lu stack_hwm=%u\n",
@@ -3736,8 +3523,9 @@ void authenticateWatchSpp(String target, String secretText) {
                 "WATCH_R4W_20/0");
 
     vTaskDelay(pdMS_TO_TICKS(3));
-    // type23/id3 仅在抓包密钥匹配时发送；解不开就跳过（不消耗序列号，后续消息
-    // 仍保持连续）。它是认证后的配置 blob，不发送不会影响 HMAC/身份认证。
+    // type23/id3 is sent only when the captured template was recoverable;
+    // otherwise it does not consume a sequence number and the live-session
+    // bootstrap remains contiguous.
     if (haveType23) {
       const uint8_t type23Seq = outgoingSequence;
       if (sendEncryptedWatchPb(outgoingSequence, encKey, round4Type23, kRound4Type23Length)) {
@@ -3811,6 +3599,7 @@ void authenticateWatchSpp(String target, String secretText) {
                   static_cast<unsigned long>(ESP.getMaxAllocHeap()));
 
     while (watchBt.connected() && !gWatchBridgeStopRequested) {
+      serviceWifiStaConnectionState(gWatchBridgeStopRequested);
       const uint32_t relNowMs = static_cast<uint32_t>(millis() - bootstrapDoneMs);
 
       // Periodic heap telemetry (every 30 s) so memory headroom is observable
@@ -3871,11 +3660,8 @@ void authenticateWatchSpp(String target, String secretText) {
 
       // Deliberately DO NOT send 2/110 in this A/B round.
       // During the timing-critical gate, run ONLY SPP/DHCP work. No Wi-Fi,
-      // ASR, stream scheduling, mDNS, HTTP, or other application work.
+      // mDNS, HTTP, or other application work.
       if (!r4GateActive) {
-        // Keep the home-WiFi uplink alive and make sure lwIP's default route
-        // points at STA before forwarding watch packets.
-        serviceWatchInternetUplink();
         drainWatchNetworkTx(outgoingSequence);
       }
 
@@ -3901,9 +3687,8 @@ void authenticateWatchSpp(String target, String secretText) {
           WiFi.persistent(false);
           WiFi.setAutoReconnect(true);
           WiFi.mode(WIFI_STA);
+          beginWifiStaConnection(kWifiStaConnectTimeoutMs);
           WiFi.begin(ssid.c_str(), wifiPass.c_str());
-          gWatchLastWifiBeginMs = millis();
-          gWatchInternetRouteReady = false;
           wifiStartPending = false;
           Serial.printf("WATCH_WIFI_STA_STARTED_NONBLOCKING rel_ms=%lu free=%lu largest=%lu\n",
                         static_cast<unsigned long>(millis() - bootstrapDoneMs),
@@ -3918,7 +3703,9 @@ void authenticateWatchSpp(String target, String secretText) {
         delay(2);
         continue;
       }
+#if HOSHINO_ENABLE_ASR
       emitWatchRawTrace(frame);
+#endif
       const size_t encryptedLength = frame.payloadLength;
       const uint8_t rawChannel = frame.payloadLength >= 1 ? (frame.payload[0] & 0x0f) : 0xff;
       const uint8_t rawOpcode = frame.payloadLength >= 2 ? frame.payload[1] : 0xff;
@@ -3953,16 +3740,6 @@ void authenticateWatchSpp(String target, String secretText) {
           Serial.printf("%02X", frame.payload[2 + i]);
         }
         Serial.println();
-      }
-      if (dataDecrypted && rawChannel == 3) {
-        // Voice/ASR was intentionally removed. Keep the SPP session alive,
-        // but never allocate capture buffers, SPIFFS files, decoder state, or
-        // a cloud ASR task for ch3 audio.
-        static bool voiceAsrDisabledLogged = false;
-        if (!voiceAsrDisabledLogged) {
-          Serial.println("WATCH_VOICE_ASR_DISABLED ch3_ignored=true");
-          voiceAsrDisabledLogged = true;
-        }
       }
       if (frame.type == 3 && rawChannel == 7 && dataLength > 0 &&
           (rawOpcode == 1 || (rawOpcode == 2 && dataDecrypted))) {
@@ -4099,6 +3876,7 @@ void authenticateWatchSpp(String target, String secretText) {
       }
     }
     if (gWatchBridgeStopRequested) Serial.println("WATCH_HOLD_STOP_REQUESTED");
+    clearWifiStaConnection(gWatchBridgeStopRequested ? "cancelled" : "spp_session_end");
     Serial.printf("WATCH_HOLD_DISCONNECTED network_rx=%lu network_tx=%lu network_drop=%lu r4_20=%u r4_tx109=%u r4_rx109=%u r4_id2count=%u r4_tx110=%u r4_23=%u r4_dhcp=%u max_ack_us=%lu slow_acks=%lu\n",
                   static_cast<unsigned long>(gWatchNetworkRxPackets),
                   static_cast<unsigned long>(gWatchNetworkTxPackets),
@@ -4401,6 +4179,135 @@ static void espDnsSelfTestCb(const char* name, const ip_addr_t* ipaddr, void* ar
   }
 }
 
+constexpr size_t kSerialSdListLimit = 48;
+constexpr size_t kSerialSdHeadMaxBytes = 128;
+
+void writeSdSerialJson(JsonDocument& document) {
+  Serial.print("SD_JSON ");
+  serializeJson(document, Serial);
+  Serial.println();
+}
+
+void writeSdSerialError(const char* event, const String& error) {
+  JsonDocument document;
+  document["event"] = event;
+  document["ok"] = false;
+  document["error"] = error;
+  writeSdSerialJson(document);
+}
+
+void handleSdSerialStatus() {
+  String error;
+  if (!sdStorage.ensureMounted(error)) {
+    writeSdSerialError("sd_status", error);
+    return;
+  }
+  const hoshino::SdStorageStatus status = sdStorage.status();
+  JsonDocument document;
+  document["event"] = "sd_status";
+  document["ok"] = true;
+  document["mounted"] = status.mounted;
+  document["root"] = hoshino::SdStorageService::rootPath();
+  document["cardType"] = status.cardType;
+  document["cardSize"] = status.cardSize;
+  document["totalBytes"] = status.totalBytes;
+  document["usedBytes"] = status.usedBytes;
+  writeSdSerialJson(document);
+}
+
+void handleSdSerialList(const String& relativePath) {
+  String error;
+  File directory = sdStorage.openRead(relativePath, error);
+  if (!directory) {
+    writeSdSerialError("sd_list", error);
+    return;
+  }
+  if (!directory.isDirectory()) {
+    directory.close();
+    writeSdSerialError("sd_list", "not_directory");
+    return;
+  }
+
+  JsonDocument begin;
+  begin["event"] = "sd_list_begin";
+  begin["ok"] = true;
+  begin["path"] = relativePath.isEmpty() ? "." : relativePath;
+  begin["limit"] = kSerialSdListLimit;
+  writeSdSerialJson(begin);
+
+  size_t count = 0;
+  bool truncated = false;
+  while (true) {
+    File child = directory.openNextFile();
+    if (!child) break;
+    if (count >= kSerialSdListLimit) {
+      truncated = true;
+      child.close();
+      break;
+    }
+    JsonDocument item;
+    item["event"] = "sd_entry";
+    item["name"] = child.name();
+    item["type"] = child.isDirectory() ? "directory" : "file";
+    if (!child.isDirectory()) item["size"] = child.size();
+    writeSdSerialJson(item);
+    child.close();
+    ++count;
+  }
+  directory.close();
+
+  JsonDocument end;
+  end["event"] = "sd_list_end";
+  end["ok"] = true;
+  end["count"] = count;
+  end["truncated"] = truncated;
+  writeSdSerialJson(end);
+}
+
+void handleSdSerialHead(const String& relativePath) {
+  if (relativePath.isEmpty()) {
+    writeSdSerialError("sd_head", "path_required");
+    return;
+  }
+  String error;
+  File file = sdStorage.openRead(relativePath, error);
+  if (!file) {
+    writeSdSerialError("sd_head", error);
+    return;
+  }
+  if (file.isDirectory()) {
+    file.close();
+    writeSdSerialError("sd_head", "not_file");
+    return;
+  }
+
+  const uint64_t fileSize = file.size();
+  uint8_t raw[kSerialSdHeadMaxBytes]{};
+  const size_t wanted = fileSize < sizeof(raw) ? static_cast<size_t>(fileSize) : sizeof(raw);
+  const size_t bytesRead = file.read(raw, wanted);
+  file.close();
+
+  unsigned char encoded[4 * ((kSerialSdHeadMaxBytes + 2) / 3) + 1]{};
+  size_t encodedLength = 0;
+  const int result = mbedtls_base64_encode(encoded, sizeof(encoded) - 1, &encodedLength, raw, bytesRead);
+  if (result != 0) {
+    writeSdSerialError("sd_head", "base64_failed");
+    return;
+  }
+  encoded[encodedLength] = '\0';
+
+  JsonDocument document;
+  document["event"] = "sd_head";
+  document["ok"] = true;
+  document["path"] = relativePath;
+  document["encoding"] = "base64";
+  document["bytes"] = bytesRead;
+  document["fileSize"] = fileSize;
+  document["truncated"] = fileSize > bytesRead;
+  document["data"] = reinterpret_cast<const char*>(encoded);
+  writeSdSerialJson(document);
+}
+
 void handleWatchProbeSerial() {
   static String command;
   while (Serial.available()) {
@@ -4413,56 +4320,12 @@ void handleWatchProbeSerial() {
       continue;
     }
     command.trim();
-    if (command.startsWith("WATCH_PROBE ")) probeWatchClassic(command.substring(12));
-    else if (command == "WATCH_SDP_CLEAR") {
-      clearWatchSdpCache("serial_clear");
-      Serial.println("WATCH_SDP_CACHE_CLEARED");
-    }
-    else if (command.startsWith("WATCH_SDP ")) probeWatchSdp(command.substring(10));
-    else if (command.startsWith("WATCH_SPP ")) connectWatchSpp(command.substring(10));
-    else if (command.startsWith("WATCH_SPP_CHANNEL ")) {
-      const String args = command.substring(18); const int separator = args.indexOf(' ');
-      if (separator > 0) connectWatchSppChannel(args.substring(0, separator), args.substring(separator + 1).toInt());
-      else Serial.println("WATCH_SPP_CHANNEL_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_VERSION ")) probeWatchSppVersion(command.substring(14));
-    else if (command.startsWith("WATCH_SESSION ")) probeWatchSppSession(command.substring(14));
-    else if (command == "WATCH_RAW_TRACE_ON") {
-      gWatchRawTraceEnabled = true;
-      Serial.println("WATCH_RAW_TRACE_ON private_local_only=true");
-    }
-    else if (command == "WATCH_RAW_TRACE_OFF") {
-      gWatchRawTraceEnabled = false;
-      Serial.println("WATCH_RAW_TRACE_OFF");
-    }
-    else if (command == "WATCH_SETUP") {
+    if (command == "WATCH_SETUP") {
       // 串口命令触发配网：写标志 + 重启，重启后进入 AP 配网模式。
       Serial.println("SETUP_MODE_REASON serial_command (save flag + reboot)");
       prefs.putBool("force_setup", true);
       delay(300);
       ESP.restart();
-    }
-    else if (command == "WATCH_DECRYPT_ROUND3") {
-      dumpRound3BootstrapPlaintext();
-    }
-    else if (command == "ESP_DNS_SELFTEST") {
-      // 独立 DNS 自测：ESP32 直接经 WiFi STA 解析 example.com，
-      // 完全绕开手表 ch7 / custom netif / NAPT 路径。
-      Serial.println("ESP_DNS_SELFTEST_TX name=example.com");
-      ip_addr_t resolved;
-      const err_t err = dns_gethostbyname("example.com", &resolved, espDnsSelfTestCb, nullptr);
-      if (err == ERR_OK) {
-        char ipbuf[48]{};
-        if (IP_IS_V4(&resolved)) {
-          const ip4_addr_t* a = ip_2_ip4(&resolved);
-          snprintf(ipbuf, sizeof(ipbuf), "%d.%d.%d.%d", ip4_addr1(a), ip4_addr2(a), ip4_addr3(a), ip4_addr4(a));
-        }
-        Serial.printf("ESP_DNS_SELFTEST_RX_CACHED name=example.com ip=%s\n", ipbuf);
-      } else if (err == ERR_INPROGRESS) {
-        Serial.println("ESP_DNS_SELFTEST_PENDING async=true wait=callback");
-      } else {
-        Serial.printf("ESP_DNS_SELFTEST_ERR err=%d\n", static_cast<int>(err));
-      }
     }
     else if (command.startsWith("WATCH_CONFIG ")) {
       // Syntax: WATCH_CONFIG ssid=xxx wifi_pass=yyy watch_mac=AA:BB:CC:DD:EE:FF watch_auth=32hex
@@ -4493,67 +4356,38 @@ void handleWatchProbeSerial() {
       prefs.putString("ap_pass", "hoshino-setup");
       Serial.printf("WATCH_CONFIG_SAVED ssid=%s mac=%s auth=%s\n",
                     ssid.c_str(), watchMac.c_str(), watchAuthKey.length() == 32 ? "ok" : "missing");
-      if (!ssid.isEmpty()) { WiFi.mode(WIFI_STA); WiFi.begin(ssid.c_str(), wifiPass.c_str()); Serial.println("WIFI_CONNECTING_STA_ONLY"); uint32_t wstart=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-wstart<15000){delay(250);} Serial.printf("WIFI_CONFIG_RESULT connected=%s ip=%s\n", WiFi.status()==WL_CONNECTED?"true":"false", WiFi.localIP().toString().c_str()); }
+      if (!ssid.isEmpty()) {
+        WiFi.mode(WIFI_STA);
+        beginWifiStaConnection(15000);
+        WiFi.begin(ssid.c_str(), wifiPass.c_str());
+        Serial.println("WIFI_CONNECTING_STA_ONLY");
+        uint32_t wstart=millis();
+        while(WiFi.status()!=WL_CONNECTED && gWifiStaConnecting && millis()-wstart<15000){
+          serviceWifiStaConnectionState(false);
+          delay(250);
+        }
+        clearWifiStaConnection(WiFi.status()==WL_CONNECTED ? "connected" : "serial_wait_end");
+        Serial.printf("WIFI_CONFIG_RESULT connected=%s ip=%s\n", WiFi.status()==WL_CONNECTED?"true":"false", WiFi.localIP().toString().c_str());
+      }
     }
-    else if (command.startsWith("WATCH_AUTH ")) {
-      const String args = command.substring(11); const int separator = args.indexOf(' ');
-      if (separator > 0) authenticateWatchSpp(args.substring(0, separator), args.substring(separator + 1));
-      else Serial.println("WATCH_AUTH_INVALID_INPUT");
+    else if (command == "SD_STATUS") {
+      handleSdSerialStatus();
     }
-    else if (command.startsWith("WATCH_BRIDGE ")) {
-      const String args = command.substring(13); const int separator = args.indexOf(' ');
-      if (separator > 0) bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1));
-      else Serial.println("WATCH_BRIDGE_INVALID_INPUT");
+    else if (command == "SD_LIST") {
+      handleSdSerialList("");
     }
-    else if (command.startsWith("WATCH_BENCH_QUICK ")) {
-      const String args = command.substring(18); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_BENCH_QUICK_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 2); }
-      else Serial.println("WATCH_BENCH_QUICK_INVALID_INPUT");
+    else if (command.startsWith("SD_LIST ")) {
+      String path = command.substring(8);
+      path.trim();
+      handleSdSerialList(path);
     }
-    else if (command.startsWith("WATCH_STREAM_256K_ECHO ")) {
-      String args = command.substring(23); int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_STREAM_256K_ECHO_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 6); }
-      else Serial.println("WATCH_STREAM_256K_ECHO_INVALID_INPUT");
+    else if (command == "SD_HEAD") {
+      handleSdSerialHead("");
     }
-    else if (command.startsWith("WATCH_STREAM_256K_ECHO_COALESCED ")) {
-      String args = command.substring(33); int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_STREAM_256K_ECHO_COALESCED_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 8); }
-      else Serial.println("WATCH_STREAM_256K_ECHO_COALESCED_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_STREAM_256K_DECODE ")) {
-      String args = command.substring(25); int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_STREAM_256K_DECODE_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 7); }
-      else Serial.println("WATCH_STREAM_256K_DECODE_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_BENCH_256K_SEG32K ")) {
-      const String args = command.substring(24); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_BENCH_256K_SEG32K_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 9); }
-      else Serial.println("WATCH_BENCH_256K_SEG32K_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_BENCH_256K_RENEW ")) {
-      const String args = command.substring(23); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_BENCH_256K_RENEW_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 4); }
-      else Serial.println("WATCH_BENCH_256K_RENEW_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_BENCH_256K_PACED ")) {
-      const String args = command.substring(23); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_BENCH_256K_PACED_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 5); }
-      else Serial.println("WATCH_BENCH_256K_PACED_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_BENCH_256K ")) {
-      const String args = command.substring(17); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_BENCH_256K_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 3); }
-      else Serial.println("WATCH_BENCH_256K_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_FINAL_ACCEPTANCE ")) {
-      String args = command.substring(23); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_FINAL_ACCEPTANCE_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 10); }
-      else Serial.println("WATCH_FINAL_ACCEPTANCE_INVALID_INPUT");
-    }
-    else if (command.startsWith("WATCH_BENCH ")) {
-      const String args = command.substring(12); const int separator = args.indexOf(' ');
-      if (separator > 0) { Serial.println("WATCH_BENCH_COMMAND_RECEIVED"); bridgeWatchQuickApp(args.substring(0, separator), args.substring(separator + 1), 1); }
-      else Serial.println("WATCH_BENCH_INVALID_INPUT");
+    else if (command.startsWith("SD_HEAD ")) {
+      String path = command.substring(8);
+      path.trim();
+      handleSdSerialHead(path);
     }
     command = "";
   }
@@ -4567,7 +4401,9 @@ void loadConfig() {
   apiKey = readConfigString("api_key", "");
   model = readConfigString("model", "mimo-v2.5-pro");
   watchMac = readConfigString("watch_mac", "");
+  if (watchMac.length() != 17) watchMac = "";
   watchAuthKey = readConfigString("watch_auth", "");
+  if (watchAuthKey.length() != 32) watchAuthKey = "";
   localToken = readConfigString("local_token", "hoshino-local");
   caPem = readConfigString("ca_pem", "");
   apPassword = readConfigString("ap_pass", "hoshino-setup");
@@ -4575,7 +4411,6 @@ void loadConfig() {
   maxTokens = prefs.getInt("max_tokens", 512);
   allowInsecureTls = prefs.getBool("insecure_tls", false);
   autoConnectWatch = prefs.getBool("watch_auto", false);
-  captureChannel8 = prefs.getBool("capture_ch8", false);
 }
 
 bool authorized() {
@@ -4611,6 +4446,261 @@ bool requireSetupAp() {
   if (isSetupApClient()) return true;
   jsonError(403, "setup_ap_required", "Sensitive setup is only available through the Hoshino-Bridge SoftAP");
   return false;
+}
+
+// This is deliberately separate from the phone-facing SoftAP setup API. The
+// existing authenticated SPP network tunnel gives the watch 10.1.10.2 and the
+// ESP32 10.1.10.1; only that peer may change the home Wi-Fi credentials here.
+// Do not relax this to a general LAN endpoint: the request carries a password.
+bool isWatchNetworkClient() {
+  if (!gWatchNetworkReady) return false;
+  const IPAddress remote = server.client().remoteIP();
+  return remote[0] == 10 && remote[1] == 1 && remote[2] == 10 && remote[3] == 2;
+}
+
+bool requireWatchSetupClient() {
+  if (!isWatchNetworkClient()) {
+    jsonError(403, "watch_tunnel_required", "watch setup is only available through the authenticated watch tunnel");
+    return false;
+  }
+  // A context marker prevents this sensitive operation being accidentally
+  // reached by an unrelated request routed through the watch netif.
+  if (server.header("X-Hoshino-Watch-Setup") != "1") {
+    jsonError(400, "watch_setup_marker_required", "missing X-Hoshino-Watch-Setup header");
+    return false;
+  }
+  return true;
+}
+
+// Storage is reachable through the already-authenticated watch tunnel, but it
+// must not inherit the sensitive Wi-Fi provisioning marker. LAN callers still
+// need the configured local token as usual.
+bool requireStorageAuth() {
+  if (authorized()) return true;
+  if (isWatchNetworkClient() && server.header("X-Hoshino-Storage") == "1") return true;
+  jsonError(401, "unauthorized", "invalid local token");
+  return false;
+}
+
+void handleWatchSetupStatus() {
+  if (!requireWatchSetupClient()) return;
+  serviceWifiStaConnectionState(false);
+  JsonDocument d;
+  d["ok"] = true;
+  d["bridge"] = "hoshino-esp32";
+  d["watchTunnel"] = true;
+  d["watchIp"] = "10.1.10.2";
+  d["gatewayIp"] = "10.1.10.1";
+  d["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+  d["wifiConfigured"] = !ssid.isEmpty();
+  d["wifiState"] = gWifiStaConnecting ? "connecting" : gWifiState;
+  d["status"] = gWifiStaConnecting ? "connecting" : gWifiState;
+  d["wifiError"] = gWifiError;
+  d["wifiReason"] = gWifiStaLastReason;
+  d["ssid"] = ssid;  // The password is never returned.
+  sendJson(200, d);
+}
+
+// Wi-Fi scan is a watch-only read operation carried by the existing
+// authenticated virtual network.  It does not touch SPP framing, the
+// Bluetooth tunnel, DHCP, or NAPT state.  Results are first copied into a
+// bounded workspace so scanDelete() can release the driver buffer before JSON serialization.
+void handleWatchSetupScan() {
+  if (!requireWatchSetupClient()) return;
+
+  serviceWifiStaConnectionState(false);
+  const bool failureBackoff = gWifiStaFailureBackoffUntilMs != 0 &&
+      static_cast<int32_t>(millis() - gWifiStaFailureBackoffUntilMs) < 0;
+  if (gWifiStaConnecting || failureBackoff) {
+    JsonDocument d;
+    d["ok"] = false;
+    d["status"] = "wifi_connecting";
+    d["message"] = "Wi-Fi 正在连接，请稍候";
+    const uint32_t remaining = failureBackoff ? gWifiStaFailureBackoffUntilMs - millis() : 1000u;
+    d["retryAfterMs"] = min(static_cast<uint32_t>(2000), max(static_cast<uint32_t>(250), remaining));
+    d["rawCount"] = 0;
+    d["truncated"] = false;
+    d["networks"].to<JsonArray>();
+    d["count"] = 0;
+    Serial.println("WATCH_WIFI_SCAN_DEFER reason=sta_connecting");
+    sendJson(200, d);
+    return;
+  }
+
+  // scanNetworks() enables STA internally, but make the mode transition
+  // explicit so an AP-only bridge becomes APSTA without tearing down the AP.
+  // Do not restore AP-only afterwards: the AP/HTTP path and watch tunnel must
+  // remain live while the driver finishes and releases its scan buffers.
+  const wifi_mode_t modeBeforeScan = WiFi.getMode();
+  if ((modeBeforeScan & WIFI_MODE_STA) == 0) {
+    const wifi_mode_t scanMode = (modeBeforeScan & WIFI_MODE_AP) ? WIFI_AP_STA : WIFI_STA;
+    if (!WiFi.mode(scanMode) || (WiFi.getMode() & WIFI_MODE_STA) == 0) {
+      return jsonError(503, "wifi_scan_mode_failed", "unable to enable Wi-Fi STA for scan");
+    }
+    Serial.printf("WATCH_WIFI_SCAN_MODE before=%d after=%d ap_preserved=%s\n",
+                  static_cast<int>(modeBeforeScan), static_cast<int>(WiFi.getMode()),
+                  (modeBeforeScan & WIFI_MODE_AP) ? "true" : "false");
+  }
+
+  // Keep this endpoint bounded: WROOM runs Classic BT + Wi-Fi + the watch
+  // virtual network at the same time, so an unbounded scan result list can
+  // create a large temporary heap peak.  Twenty APs is more than enough for
+  // the watch UI while keeping the response and JSON document small.
+  constexpr size_t kResultLimit = 20;
+  String selectedSsids[kResultLimit];
+  int32_t selectedRssi[kResultLimit] = {};
+  size_t selectedCount = 0;
+
+  Serial.printf("WATCH_WIFI_SCAN_BEGIN free=%lu largest=%lu min_free=%lu\n",
+                static_cast<unsigned long>(ESP.getFreeHeap()),
+                static_cast<unsigned long>(ESP.getMaxAllocHeap()),
+                static_cast<unsigned long>(ESP.getMinFreeHeap()));
+
+  const int16_t found = WiFi.scanNetworks(false, true);
+  if (found < 0) {
+    WiFi.scanDelete();
+    Serial.printf("WATCH_WIFI_SCAN_FAIL code=%d free=%lu largest=%lu\n",
+                  static_cast<int>(found),
+                  static_cast<unsigned long>(ESP.getFreeHeap()),
+                  static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+    return jsonError(503, "wifi_scan_failed", String("scanNetworks=") + String(found));
+  }
+
+  // Copy only the strongest unique APs into a bounded workspace.  The scan
+  // driver buffer is released before ArduinoJson builds the response, which
+  // avoids holding the driver result table + JSON tree + serialized String at
+  // the same time.
+  for (int16_t i = 0; i < found; ++i) {
+    const String networkName = WiFi.SSID(i);
+    if (networkName.isEmpty()) continue;
+    const int32_t rssi = WiFi.RSSI(i);
+
+    bool duplicate = false;
+    for (size_t j = 0; j < selectedCount; ++j) {
+      if (selectedSsids[j] == networkName) {
+        if (rssi > selectedRssi[j]) selectedRssi[j] = rssi;
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) continue;
+
+    if (selectedCount < kResultLimit) {
+      selectedSsids[selectedCount] = networkName;
+      selectedRssi[selectedCount] = rssi;
+      ++selectedCount;
+      continue;
+    }
+
+    size_t weakest = 0;
+    for (size_t j = 1; j < selectedCount; ++j) {
+      if (selectedRssi[j] < selectedRssi[weakest]) weakest = j;
+    }
+    if (rssi > selectedRssi[weakest]) {
+      selectedSsids[weakest] = networkName;
+      selectedRssi[weakest] = rssi;
+    }
+  }
+
+  Serial.printf("WATCH_WIFI_SCAN_RAW count=%d selected=%u free=%lu largest=%lu\n",
+                static_cast<int>(found), static_cast<unsigned>(selectedCount),
+                static_cast<unsigned long>(ESP.getFreeHeap()),
+                static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+  WiFi.scanDelete();
+  Serial.printf("WATCH_WIFI_SCAN_BUFFER_FREED free=%lu largest=%lu\n",
+                static_cast<unsigned long>(ESP.getFreeHeap()),
+                static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+
+  JsonDocument d;
+  d["ok"] = true;
+  d["status"] = "success";
+  d["message"] = "扫描成功";
+  d["rawCount"] = found;
+  d["truncated"] = static_cast<size_t>(found) > selectedCount;
+  JsonArray networks = d["networks"].to<JsonArray>();
+  for (size_t i = 0; i < selectedCount; ++i) {
+    JsonObject item = networks.add<JsonObject>();
+    item["ssid"] = selectedSsids[i].c_str();
+    item["rssi"] = selectedRssi[i];
+  }
+  d["count"] = networks.size();
+
+  Serial.printf("WATCH_WIFI_SCAN_RESPONSE count=%u free=%lu largest=%lu min_free=%lu\n",
+                static_cast<unsigned>(networks.size()),
+                static_cast<unsigned long>(ESP.getFreeHeap()),
+                static_cast<unsigned long>(ESP.getMaxAllocHeap()),
+                static_cast<unsigned long>(ESP.getMinFreeHeap()));
+  sendJson(200, d);
+}
+
+String body();
+
+void handleWatchSetupWifi() {
+  if (!requireWatchSetupClient()) return;
+  const String requestBody = body();
+  if (requestBody.isEmpty()) return jsonError(400, "invalid_body", "empty or too large");
+  JsonDocument in;
+  if (deserializeJson(in, requestBody)) return jsonError(400, "invalid_json", "cannot parse json");
+  const String nextSsid = String(in["ssid"] | "");
+  const String nextPass = String(in["wifiPassword"] | "");
+  // Preserve the strings exactly as received. A leading space is a valid SSID byte.
+  if (nextSsid.isEmpty()) {
+    return jsonError(400, "invalid_ssid", "Wi-Fi 名称不能为空");
+  }
+  if (nextSsid.length() > 64) {
+    return jsonError(400, "invalid_ssid", "Wi-Fi 名称长度超过 64 字节");
+  }
+  if (nextPass.length() < 8) {
+    return jsonError(400, "invalid_password", "Wi-Fi 密码至少需要 8 个字符");
+  }
+  if (nextPass.length() > 128) {
+    return jsonError(400, "invalid_password", "Wi-Fi 密码长度超过 128 字节");
+  }
+  serviceWifiStaConnectionState(false);
+  if (gWifiStaConnecting || (gWifiStaFailureBackoffUntilMs != 0 &&
+      static_cast<int32_t>(millis() - gWifiStaFailureBackoffUntilMs) < 0)) {
+    JsonDocument busy;
+    busy["ok"] = true;
+    busy["saved"] = false;
+    busy["rebooting"] = false;
+    busy["status"] = "wifi_connecting";
+    busy["wifiState"] = "connecting";
+    busy["wifiError"] = gWifiError;
+    busy["wifiReason"] = gWifiStaLastReason;
+    busy["retryAfterMs"] = 1000;
+    busy["message"] = "Wi-Fi 正在连接，请稍候";
+    sendJson(200, busy);
+    return;
+  }
+
+  // Keep AP/HTTP/tunnel alive while the single asynchronous STA attempt runs.
+  const wifi_mode_t before = WiFi.getMode();
+  if ((before & WIFI_MODE_STA) == 0) {
+    const wifi_mode_t withSta = (before & WIFI_MODE_AP) ? WIFI_AP_STA : WIFI_STA;
+    if (!WiFi.mode(withSta) || (WiFi.getMode() & WIFI_MODE_STA) == 0) {
+      return jsonError(503, "wifi_connect_start_failed", "无法启用 Wi-Fi STA");
+    }
+  }
+  gPendingWifiSsid = nextSsid;
+  gPendingWifiPassword = nextPass;
+  gWifiProvisioningPending = true;
+  WiFi.setAutoReconnect(true);
+  beginWifiStaConnection(kWifiStaConnectTimeoutMs);
+  WiFi.begin(gPendingWifiSsid.c_str(), gPendingWifiPassword.c_str());
+  Serial.printf("WATCH_WIFI_CONNECT_BEGIN ssid_bytes=%u timeout_ms=%lu\n",
+                static_cast<unsigned>(gPendingWifiSsid.length()),
+                static_cast<unsigned long>(kWifiStaConnectTimeoutMs));
+  JsonDocument out;
+  out["ok"] = true;
+  out["saved"] = false;
+  out["rebooting"] = false;
+  out["status"] = "connecting";
+  out["wifiState"] = "connecting";
+  out["wifiError"] = "";
+  out["wifiReason"] = 0;
+  out["retryAfterMs"] = 500;
+  out["message"] = "Wi-Fi 正在连接，请稍候";
+  sendJson(200, out);
 }
 
 void recordWatchFetchProbe() {
@@ -4711,7 +4801,7 @@ void resetWatchConversationContext(const char* reason) {
 
 void maybeExpireWatchConversationContext() {
   if (gWatchContextCount == 0 || gWatchContextLastMs == 0) return;
-  if (millis() - gWatchContextLastMs >= kXiaoAiContextIdleResetMs) resetWatchConversationContext("idle_timeout");
+  if (millis() - gWatchContextLastMs >= kWatchContextIdleResetMs) resetWatchConversationContext("idle_timeout");
 }
 
 void appendWatchConversationTurn(const String& userText, const String& assistantText) {
@@ -4797,6 +4887,7 @@ bool mimoWatchRequest(const String& userText, String& answer, String& error) {
 
 
 
+#if HOSHINO_ENABLE_ASR
 // ---- MiMo ASR pipeline: watch Opus aggregate -> PCM16 WAV -> streamed Base64 -> MiMo ----
 void writeLe16(File& f, uint16_t value) {
   const uint8_t b[] = {static_cast<uint8_t>(value & 0xff), static_cast<uint8_t>((value >> 8) & 0xff)};
@@ -5123,28 +5214,23 @@ bool scheduleWatchAsrJob(const char* packetPath, const char* wavPath, bool final
                 static_cast<unsigned long>(sessionId), finalResult ? "true" : "false");
   return true;
 }
+#endif  // HOSHINO_ENABLE_ASR
 
-const char kWebUi[] PROGMEM = R"HTML(
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hoshino Bridge</title>
-<style>body{font-family:system-ui;background:#0c1118;color:#eef4ff;max-width:720px;margin:auto;padding:20px}input,button{box-sizing:border-box;width:100%;padding:11px;margin:5px 0;border-radius:9px;border:1px solid #334;background:#151d29;color:#fff}button{background:#2c6bed;cursor:pointer}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.card{background:#111923;padding:15px;border-radius:12px;margin:12px 0}label{display:block;margin-top:8px}.choice{display:flex;justify-content:space-between;gap:12px;text-align:left}.choice small{opacity:.7;white-space:nowrap}.muted{opacity:.72;font-size:.9em}pre{white-space:pre-wrap;word-break:break-word;background:#080d13;padding:12px;border-radius:8px}@media(max-width:650px){.row{grid-template-columns:1fr}}</style></head><body>
-<h2>Hoshino ESP32 · Watch Gateway</h2><p class="muted">选择家庭 Wi‑Fi 与手表，填入手表 AuthKey 后保存即可。</p>
-<div class="card" style="border:1px solid #2c6bed"><b>⚙ 重新配网</b>：设备正常运行后，长按开发板 <b>BOOT</b> 键约 2 秒。设备会重启回到此热点；请不要在上电瞬间按住 BOOT。</div>
-<div class=card><h3>家庭 Wi‑Fi</h3><button onclick=scanWifi()>扫描附近网络</button><p class=muted id=wifiStatus>点击扫描，然后选择你的家庭网络。</p><div id=networks></div><label>已选网络<input id=ssid autocomplete=off placeholder="扫描后点击网络；隐藏网络可手动填写"></label><label>Wi‑Fi 密码<input id=wp type=password autocomplete=current-password placeholder="输入该网络的密码"></label></div>
-<div class=card><h3>手表蓝牙</h3><button onclick=scanBluetooth()>扫描附近蓝牙设备</button><p class=muted id=bluetoothStatus>选择你的手表，设备地址会自动填入。</p><div id=bluetoothDevices></div><label>已选手表 MAC<input id=mac placeholder="扫描后点击手表；也可手动填写"></label><label>Watch AuthKey（32 位十六进制）<input id=wauth type=password autocomplete=off placeholder="粘贴手表对应的 AuthKey"></label></div>
-<div class=card><h3>热点密码（可选）</h3><label>Vela-Bridge 密码<input id=ap type=password value="hoshino-setup" minlength=8></label></div>
-<button onclick=save()>保存并连接</button><pre id=o>Ready</pre>
+// Phone-facing setup page. Keep this surface limited to the AP configuration
+// endpoints below; bridge controls and cloud/chat/storage APIs stay off AP.
+const char kMinimalSetupWebUi[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hoshino 配网</title>
+<style>body{font-family:system-ui;background:#0c1118;color:#eef4ff;max-width:680px;margin:auto;padding:18px}input,button{box-sizing:border-box;width:100%;padding:11px;margin:5px 0;border-radius:8px;border:1px solid #334;background:#151d29;color:#fff}button{background:#2c6bed;cursor:pointer}.card{background:#111923;padding:15px;border-radius:12px;margin:12px 0}label{display:block;margin-top:10px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.check{width:auto}pre{white-space:pre-wrap;word-break:break-word;background:#080d13;padding:12px;border-radius:8px}@media(max-width:650px){.row{grid-template-columns:1fr}}</style></head><body>
+<h2>Hoshino ESP32 配网</h2><p>请填写家庭 Wi‑Fi 和手表身份。保存后设备会重启；热点消失属于正常现象。</p>
+<div class=card><div class=row><label>家庭 Wi‑Fi SSID<input id=ssid autocomplete=off></label><label>Wi‑Fi 密码<input id=wp type=password autocomplete=off></label></div>
+<div class=row><label>Watch MAC<input id=mac placeholder="AA:BB:CC:DD:EE:FF" autocomplete=off></label><label>Watch Auth Key<input id=wauth type=password placeholder="32 位十六进制" autocomplete=off></label></div>
+<div class=row><label>本地管理 Token<input id=token value="hoshino-local" autocomplete=off></label><label>Setup AP 密码<input id=ap type=password value="hoshino-setup" autocomplete=off></label></div>
+<label><input class=check id=autow type=checkbox checked> 开机自动连接手表</label><button onclick=save()>保存配置并重启</button><pre id=o>正在读取状态…</pre></div>
 <script>
 const o=document.getElementById('o');
-async function setupApi(path,opt={}){try{let r=await fetch(path,opt);let t=await r.text();try{return JSON.parse(t)}catch(e){o.textContent=t;return{ok:false,error:'invalid_response'}}}catch(e){return{ok:false,error:String(e)}}}
-function chooseWifi(name){ssid.value=name;wp.focus();wifiStatus.textContent='已选择：'+name+'。请输入密码后保存。'}
-function renderNetworks(items){const box=document.getElementById('networks');box.replaceChildren();for(const item of items){const b=document.createElement('button');b.className='choice';const name=document.createElement('span');name.textContent=item.ssid;const meta=document.createElement('small');meta.textContent=item.rssi+' dBm'+(item.secure?' · 加密':' · 开放');b.append(name,meta);b.onclick=()=>chooseWifi(item.ssid);box.append(b)}}
-function chooseBluetooth(address,name){mac.value=address;wauth.focus();bluetoothStatus.textContent='已选择：'+name+'（'+address+'）。请输入 AuthKey 后保存。'}
-function renderBluetooth(items){const box=document.getElementById('bluetoothDevices');box.replaceChildren();for(const item of items){const b=document.createElement('button');b.className='choice';const name=document.createElement('span');name.textContent=item.name||'未命名设备';const meta=document.createElement('small');meta.textContent=item.address+' · '+item.rssi+' dBm';b.append(name,meta);b.onclick=()=>chooseBluetooth(item.address,item.name||'未命名设备');box.append(b)}}
-async function pollWifi(){let d=await setupApi('/setup/wifi/scan');if(!d.ok){wifiStatus.textContent='扫描失败：'+(d.error||'未知错误');return}if(d.scanning){setTimeout(pollWifi,700);return}if(!d.ready){wifiStatus.textContent='扫描尚未开始。';return}renderNetworks(d.networks||[]);wifiStatus.textContent=(d.networks||[]).length?'请选择一个网络。':'没有发现网络；可手动填写 SSID。'}
-async function scanWifi(){wifiStatus.textContent='正在扫描…';document.getElementById('networks').replaceChildren();let d=await setupApi('/setup/wifi/scan?start=1');if(!d.ok){wifiStatus.textContent='扫描启动失败：'+(d.error||'未知错误');return}setTimeout(pollWifi,700)}
-async function pollBluetooth(){let d=await setupApi('/setup/bluetooth/scan');if(!d.ok){bluetoothStatus.textContent='扫描失败：'+(d.error||'未知错误');return}if(d.scanning){setTimeout(pollBluetooth,700);return}if(!d.ready){bluetoothStatus.textContent='扫描尚未开始。';return}renderBluetooth(d.devices||[]);bluetoothStatus.textContent=(d.devices||[]).length?'请选择你的手表。':'没有发现设备；可手动填写 MAC。'}
-async function scanBluetooth(){bluetoothStatus.textContent='正在扫描经典蓝牙（约 8 秒）…';document.getElementById('bluetoothDevices').replaceChildren();let d=await setupApi('/setup/bluetooth/scan?start=1');if(!d.ok){bluetoothStatus.textContent='扫描启动失败：'+(d.error||'未知错误');return}setTimeout(pollBluetooth,700)}
-async function save(){let body={ssid:ssid.value,wifiPassword:wp.value,watchMac:mac.value,watchAuthKey:wauth.value,apPassword:ap.value};let d=await setupApi('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(d.ok){o.textContent='✅ 配置已保存，设备正在重启并连接家庭 Wi‑Fi…'}else{o.textContent='❌ 保存失败：'+(d.error||JSON.stringify(d))}}
+async function status(){try{const r=await fetch('/setup/status');const d=await r.json();o.textContent=d.ok?('热点地址：'+(d.setupApIp||location.hostname)+'\n家庭 Wi‑Fi：'+(d.wifiConfigured?'已配置':'未配置')+'\n手表身份：'+(d.watchConfigured?'已配置':'未配置')):JSON.stringify(d)}catch(e){o.textContent=String(e)}}
+async function save(){const body={ssid:ssid.value,wifiPassword:wp.value,watchMac:mac.value,watchAuthKey:wauth.value,localToken:token.value,apPassword:ap.value,autoConnectWatch:autow.checked};o.textContent='正在保存…';try{const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();o.textContent=d.ok?'已保存，设备正在重启，请等待热点消失。':('保存失败：'+(d.message||d.error||JSON.stringify(d)))}catch(e){o.textContent=String(e)}}
+status();
 </script></body></html>
 )HTML";
 
@@ -5253,7 +5339,7 @@ void handleStatus(bool publicSetup) {
   d["networkDroppedPackets"] = gWatchNetworkDroppedPackets;
   d["lastAiAnswer"] = gLastAiAnswer;
   d["watchConversationTurns"] = gWatchContextCount;
-  d["watchConversationIdleResetMs"] = kXiaoAiContextIdleResetMs;
+  d["watchConversationIdleResetMs"] = kWatchContextIdleResetMs;
   d["autoConnectWatch"] = autoConnectWatch;
   d["caConfigured"] = !caPem.isEmpty();
   d["insecureTls"] = allowInsecureTls;
@@ -5262,201 +5348,302 @@ void handleStatus(bool publicSetup) {
   sendJson(200, d);
 }
 
+String storageContentType(const String& path) {
+  String lower = path;
+  lower.toLowerCase();
+  if (lower.endsWith(".json")) return "application/json";
+  if (lower.endsWith(".txt") || lower.endsWith(".log") || lower.endsWith(".md")) return "text/plain; charset=utf-8";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html; charset=utf-8";
+  if (lower.endsWith(".css")) return "text/css; charset=utf-8";
+  if (lower.endsWith(".js")) return "application/javascript";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".wav")) return "audio/wav";
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".bin")) return "application/octet-stream";
+  return "application/octet-stream";
+}
+
+int storageErrorStatus(const String& error) {
+  if (error == "not_found") return 404;
+  if (error == "path_required" || error == "path_too_long" ||
+      error == "invalid_path" || error == "invalid_path_segment" ||
+      error == "invalid_path_character") return 400;
+  return 503;
+}
+
+void handleStorageStatus() {
+  if (!requireStorageAuth()) return;
+  String error;
+  if (!sdStorage.ensureMounted(error)) return jsonError(503, "sd_unavailable", error);
+  const hoshino::SdStorageStatus st = sdStorage.status();
+  JsonDocument d;
+  d["ok"] = true;
+  d["mounted"] = st.mounted;
+  d["root"] = hoshino::SdStorageService::rootPath();
+  d["cardType"] = st.cardType;
+  d["cardSizeBytes"] = st.cardSize;
+  d["totalBytes"] = st.totalBytes;
+  d["usedBytes"] = st.usedBytes;
+  d["freeBytes"] = st.totalBytes >= st.usedBytes ? st.totalBytes - st.usedBytes : 0;
+  d["spi"] = "VSPI";
+  d["pins"]["sck"] = 18;
+  d["pins"]["miso"] = 19;
+  d["pins"]["mosi"] = 23;
+  d["pins"]["cs"] = 5;
+  sendJson(200, d);
+}
+
+void handleStorageList() {
+  if (!requireStorageAuth()) return;
+  const String path = server.arg("path");
+  String error;
+  File dir = sdStorage.openRead(path, error);
+  if (!dir) return jsonError(storageErrorStatus(error), "storage_list_failed", error);
+  if (!dir.isDirectory()) {
+    dir.close();
+    return jsonError(400, "not_a_directory", path);
+  }
+
+  JsonDocument d;
+  d["ok"] = true;
+  d["path"] = path;
+  JsonArray items = d["items"].to<JsonArray>();
+  constexpr size_t kMaxStorageListEntries = 48;
+  size_t count = 0;
+  bool truncated = false;
+  for (;;) {
+    File child = dir.openNextFile();
+    if (!child) break;
+    if (count >= kMaxStorageListEntries) {
+      truncated = true;
+      child.close();
+      break;
+    }
+    JsonObject item = items.add<JsonObject>();
+    item["name"] = child.name();
+    item["directory"] = child.isDirectory();
+    item["size"] = child.isDirectory() ? 0 : child.size();
+    child.close();
+    ++count;
+  }
+  dir.close();
+  d["count"] = count;
+  d["truncated"] = truncated;
+  sendJson(200, d);
+}
+
+void handleStorageFile() {
+  if (!requireStorageAuth()) return;
+  const String path = server.arg("path");
+  if (path.isEmpty()) return jsonError(400, "path_required", "use ?path=relative/file.bin");
+  String error;
+  File file = sdStorage.openRead(path, error);
+  if (!file) return jsonError(storageErrorStatus(error), "storage_read_failed", error);
+  if (file.isDirectory()) {
+    file.close();
+    return jsonError(400, "is_a_directory", path);
+  }
+  server.sendHeader("Cache-Control", "private, max-age=60");
+  server.sendHeader("X-Hoshino-Storage", "sd");
+  server.streamFile(file, storageContentType(path));
+  file.close();
+}
+
+void handleStorageChunk() {
+  if (!requireStorageAuth()) return;
+  const String path = server.arg("path");
+  if (path.isEmpty()) return jsonError(400, "path_required", "use ?path=relative/file.bin");
+
+  const long requestedOffset = server.hasArg("offset") ? server.arg("offset").toInt() : 0;
+  const long requestedLength = server.hasArg("length") ? server.arg("length").toInt() : 1024;
+  if (requestedOffset < 0 || requestedLength <= 0 || requestedLength > 2048) {
+    return jsonError(400, "invalid_range", "offset>=0 and 1<=length<=2048 required");
+  }
+
+  String error;
+  File file = sdStorage.openRead(path, error);
+  if (!file) return jsonError(storageErrorStatus(error), "storage_read_failed", error);
+  if (file.isDirectory()) {
+    file.close();
+    return jsonError(400, "is_a_directory", path);
+  }
+
+  const size_t fileSize = file.size();
+  const size_t offset = static_cast<size_t>(requestedOffset);
+  if (offset > fileSize) {
+    file.close();
+    return jsonError(416, "range_not_satisfiable", "offset exceeds file size");
+  }
+  if (!file.seek(offset, SeekSet)) {
+    file.close();
+    return jsonError(500, "seek_failed", path);
+  }
+
+  const size_t toRead = min(static_cast<size_t>(requestedLength), fileSize - offset);
+  uint8_t* raw = static_cast<uint8_t*>(malloc(toRead ? toRead : 1));
+  if (!raw) {
+    file.close();
+    return jsonError(503, "low_memory", "cannot allocate SD read buffer");
+  }
+  const size_t bytesRead = toRead ? file.read(raw, toRead) : 0;
+  file.close();
+
+  const size_t encodedCapacity = 4 * ((bytesRead + 2) / 3) + 1;
+  unsigned char* encoded = static_cast<unsigned char*>(malloc(encodedCapacity));
+  if (!encoded) {
+    free(raw);
+    return jsonError(503, "low_memory", "cannot allocate base64 buffer");
+  }
+  size_t encodedLength = 0;
+  const int base64Rc = mbedtls_base64_encode(encoded, encodedCapacity, &encodedLength, raw, bytesRead);
+  free(raw);
+  if (base64Rc != 0) {
+    free(encoded);
+    return jsonError(500, "base64_failed", String(base64Rc));
+  }
+  encoded[encodedLength] = '\0';
+
+  String response;
+  response.reserve(encodedLength + 192);
+  response += "{\"ok\":true,\"encoding\":\"base64\",\"offset\":";
+  response += String(static_cast<unsigned long>(offset));
+  response += ",\"bytes\":";
+  response += String(static_cast<unsigned long>(bytesRead));
+  response += ",\"nextOffset\":";
+  response += String(static_cast<unsigned long>(offset + bytesRead));
+  response += ",\"size\":";
+  response += String(static_cast<unsigned long>(fileSize));
+  response += ",\"eof\":";
+  response += (offset + bytesRead >= fileSize) ? "true" : "false";
+  response += ",\"data\":\"";
+  response.concat(reinterpret_cast<const char*>(encoded), encodedLength);
+  response += "\"}";
+  free(encoded);
+  server.send(200, "application/json", response);
+}
+
+void handlePhoneSetupStatus() {
+  if (!isSetupApClient()) {
+    jsonError(403, "setup_ap_required", "setup status is only available through the Hoshino-Bridge SoftAP");
+    return;
+  }
+  JsonDocument d;
+  d["ok"] = true;
+  d["wifiConfigured"] = !ssid.isEmpty();
+  d["watchConfigured"] = watchMac.length() == 17 && watchAuthKey.length() == 32;
+  d["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+  d["setupApIp"] = WiFi.softAPIP().toString();
+  sendJson(200, d);
+}
+
+void handlePhoneSetupSave() {
+  if (!requireSetupAp()) return;
+  const String requestBody = body();
+  if (requestBody.isEmpty()) return jsonError(400, "invalid_body", "empty or too large");
+
+  JsonDocument in;
+  if (deserializeJson(in, requestBody)) return jsonError(400, "invalid_json", "cannot parse json");
+
+  String newSsid = String(in["ssid"] | "");
+  String newPass = String(in["wifiPassword"] | "");
+  String newMac = String(in["watchMac"] | "");
+  String newAuth = String(in["watchAuthKey"] | "");
+  String newToken = String(in["localToken"] | "");
+  String newAp = String(in["apPassword"] | "");
+  const bool newAuto = in["autoConnectWatch"] | false;
+
+  newMac.trim();
+  newMac.toUpperCase();
+  newAuth.trim();
+  newAuth.toLowerCase();
+  if (newToken.isEmpty()) newToken = localToken;
+  if (newAp.isEmpty()) newAp = apPassword;
+
+  if (newSsid.length() > 64 || newPass.length() > 128 || newToken.length() > 128 ||
+      newAp.length() < 8 || newAp.length() > 63) {
+    return jsonError(400, "invalid_config", "field length invalid");
+  }
+  if (!newMac.isEmpty() && newMac.length() != 17) {
+    return jsonError(400, "invalid_watch_mac", "expected AA:BB:CC:DD:EE:FF");
+  }
+  if (!newAuth.isEmpty()) {
+    if (newAuth.length() != 32) return jsonError(400, "invalid_watch_auth", "expected 32 hexadecimal characters");
+    for (size_t i = 0; i < newAuth.length(); ++i) {
+      if (!isxdigit(static_cast<unsigned char>(newAuth[i]))) {
+        return jsonError(400, "invalid_watch_auth", "expected hexadecimal characters only");
+      }
+    }
+  }
+
+  const String oldSsid = ssid;
+  const String oldPass = wifiPass;
+  const String oldMac = watchMac;
+  const String oldAuth = watchAuthKey;
+  const String oldToken = localToken;
+  const String oldAp = apPassword;
+  const bool oldAuto = autoConnectWatch;
+  const bool saved =
+      prefs.putString("ssid", newSsid) == newSsid.length() &&
+      prefs.putString("wifi_pass", newPass) == newPass.length() &&
+      prefs.putString("watch_mac", newMac) == newMac.length() &&
+      prefs.putString("watch_auth", newAuth) == newAuth.length() &&
+      prefs.putString("local_token", newToken) == newToken.length() &&
+      prefs.putString("ap_pass", newAp) == newAp.length();
+  if (!saved) {
+    prefs.putString("ssid", oldSsid);
+    prefs.putString("wifi_pass", oldPass);
+    prefs.putString("watch_mac", oldMac);
+    prefs.putString("watch_auth", oldAuth);
+    prefs.putString("local_token", oldToken);
+    prefs.putString("ap_pass", oldAp);
+    prefs.putBool("watch_auto", oldAuto);
+    return jsonError(503, "config_save_failed", "preferences write failed; previous configuration restored");
+  }
+  prefs.putBool("watch_auto", newAuto || (newMac.length() == 17 && newAuth.length() == 32));
+  ssid = newSsid;
+  wifiPass = newPass;
+  watchMac = newMac;
+  watchAuthKey = newAuth;
+  localToken = newToken;
+  apPassword = newAp;
+  autoConnectWatch = newAuto || (newMac.length() == 17 && newAuth.length() == 32);
+
+  JsonDocument out;
+  out["ok"] = true;
+  out["saved"] = true;
+  out["rebooting"] = true;
+  out["watchConfigured"] = newMac.length() == 17 && newAuth.length() == 32;
+  sendJson(200, out);
+  Serial.println("SETUP_SAVED rebooting_to_normal_mode");
+  delay(400);
+  ESP.restart();
+}
+
 void setupRoutes() {
-  const char* keys[] = {"Authorization", "X-Hoshino-Token"};
-  server.collectHeaders(keys, 2);
-  server.on("/", HTTP_GET, [](){ server.send_P(200, "text/html; charset=utf-8", kWebUi); });
-  server.on("/setup/status", HTTP_GET, [](){
-    if (server.arg("source") == "watch_quickapp") recordWatchFetchProbe();
-    handleStatus(true);
-  });
-  server.on("/setup/trace", HTTP_GET, [](){ handleFetchTrace(); });
-  server.on("/setup/wifi/scan", HTTP_GET, [](){
-    if (!requireSetupAp()) return;
-
-    const bool start = server.arg("start") == "1";
-    const int state = WiFi.scanComplete();
-    JsonDocument response;
-    response["ok"] = true;
-
-    if (start) {
-      if (state == WIFI_SCAN_RUNNING) {
-        response["scanning"] = true;
-        sendJson(200, response);
-        return;
-      }
-      if (state >= 0) WiFi.scanDelete();
-      // AP+STA keeps the setup page reachable while the radio scans.
-      WiFi.mode(WIFI_AP_STA);
-      const int started = WiFi.scanNetworks(true, true);
-      if (started == WIFI_SCAN_FAILED) {
-        jsonError(503, "wifi_scan_failed", "unable to start scan");
-        return;
-      }
-      response["scanning"] = true;
-      sendJson(202, response);
-      return;
-    }
-
-    if (state == WIFI_SCAN_RUNNING) {
-      response["scanning"] = true;
-      sendJson(200, response);
-      return;
-    }
-    if (state < 0) {
-      response["ready"] = false;
-      sendJson(200, response);
-      return;
-    }
-
-    JsonArray networks = response["networks"].to<JsonArray>();
-    uint8_t listed = 0;
-    for (int i = 0; i < state && listed < kSetupWifiScanMaxResults; ++i) {
-      const String name = WiFi.SSID(i);
-      if (name.isEmpty()) continue;
-      JsonObject network = networks.add<JsonObject>();
-      network["ssid"] = name;
-      network["rssi"] = WiFi.RSSI(i);
-      network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
-      ++listed;
-    }
-    WiFi.scanDelete();
-    response["ready"] = true;
-    sendJson(200, response);
-  });
-  server.on("/setup/bluetooth/scan", HTTP_GET, [](){
-    if (!requireSetupAp()) return;
-    JsonDocument response;
-    response["ok"] = true;
-
-    if (server.arg("start") == "1") {
-      if (!gSetupBluetoothScanRunning && !startSetupBluetoothScan()) {
-        jsonError(503, "bluetooth_scan_unavailable", "setup scan cannot start");
-        return;
-      }
-      response["scanning"] = true;
-      sendJson(202, response);
-      return;
-    }
-
-    if (gSetupBluetoothScanRunning) {
-      response["scanning"] = true;
-      sendJson(200, response);
-      return;
-    }
-    if (!gSetupBluetoothScanReady) {
-      response["ready"] = false;
-      sendJson(200, response);
-      return;
-    }
-    if (gSetupBluetoothScanFailed) {
-      jsonError(503, "bluetooth_scan_failed", "Classic Bluetooth discovery failed");
-      return;
-    }
-
-    JsonArray devices = response["devices"].to<JsonArray>();
-    const uint8_t count = gSetupBluetoothResultCount;
-    for (uint8_t i = 0; i < count; ++i) {
-      const SetupBluetoothDevice& device = gSetupBluetoothResults[i];
-      if (device.address[0] == '\0') continue;
-      JsonObject item = devices.add<JsonObject>();
-      item["name"] = device.name;
-      item["address"] = device.address;
-      item["rssi"] = device.rssi;
-      item["cod"] = device.cod;
-    }
-    response["ready"] = true;
-    sendJson(200, response);
-  });
-  server.on("/api/v1/status", HTTP_GET, [](){ handleStatus(false); });
-  server.on("/api/v1/models", HTTP_GET, [](){
-    if (!requireAuth()) return;
-    JsonDocument d; d["ok"] = true; JsonArray a=d["models"].to<JsonArray>(); a.add("mimo-v2.5-pro"); a.add("mimo-v2.5"); sendJson(200,d);
-  });
-  server.on("/setup", HTTP_POST, [](){
-    if (!requireSetupAp()) return;
-    String b=body(); if (b.isEmpty()) return jsonError(400,"invalid_body","empty or too large");
-    JsonDocument d; if (deserializeJson(d,b)) return jsonError(400,"invalid_json","cannot parse json");
-    String newSsid=d["ssid"]|""; String newPass=d["wifiPassword"]|"";
-    String newMac=d["watchMac"]|""; String newWatchAuth=d["watchAuthKey"]|"";
-    String newAp=d["apPassword"]|"hoshino-setup";
-    newMac.trim(); newMac.toUpperCase(); newWatchAuth.trim(); newWatchAuth.toLowerCase();
-    if (!newMac.isEmpty() && newMac.length()!=17) return jsonError(400,"invalid_watch_mac","expected AA:BB:CC:DD:EE:FF");
-    if (!newWatchAuth.isEmpty()) {
-      if (newWatchAuth.length()!=32) return jsonError(400,"invalid_watch_auth","expected 32 hex characters");
-      for (size_t i=0;i<newWatchAuth.length();++i) if (!isxdigit(static_cast<unsigned char>(newWatchAuth[i]))) return jsonError(400,"invalid_watch_auth","expected hex only");
-    }
-    if (newSsid.length()>64||newPass.length()>128||newAp.length()<8||newAp.length()>63) return jsonError(400,"invalid_config","field length invalid");
-    prefs.putString("ssid",newSsid); prefs.putString("wifi_pass",newPass);
-    prefs.putString("watch_mac",newMac); prefs.putString("watch_auth",newWatchAuth);
-    // 只要配了完整的 Watch MAC + Auth Key，就强制开机自动连接手表，
-    // 避免用户配好后重启却因忘勾「自动连接」而无法自动进入工作模式。
-    prefs.putBool("watch_auto", newMac.length()==17 && newWatchAuth.length()==32);
-    prefs.putString("ap_pass",newAp);
-    prefs.remove("base_url"); prefs.remove("api_key"); prefs.remove("model");
-    prefs.remove("asr_model"); prefs.remove("asr_lang"); prefs.remove("native_xiaoai");
-    prefs.remove("chat_after_asr"); prefs.remove("local_token"); prefs.remove("ca_pem");
-    prefs.remove("max_tokens"); prefs.remove("insecure_tls");
-    loadConfig();
-    JsonDocument r; r["ok"]=true; r["saved"]=true; r["rebooting"]=true; r["watchConfigured"]=watchMac.length()==17&&watchAuthKey.length()==32; sendJson(200,r);
-    // 保存成功后重启，切回正常工作模式（STA 连接已保存的 WiFi）。
-    Serial.println("SETUP_SAVED rebooting_to_normal_mode");
-    delay(400);   // 让 HTTP 响应发出去
-    ESP.restart();
-  });
-  server.on("/api/v1/config", HTTP_POST, [](){
-    if (!requireAuth()) return;
-    jsonError(403,"use_setup_ap","Cloud keys, Wi-Fi password and watch auth key can only be changed while connected to the Hoshino-Bridge setup AP.");
-  });
-  server.on("/api/v1/watch/start", HTTP_POST, [](){
-    if (!requireAuth()) return;
-    String error;
-    if (!startWatchBridge(error)) return jsonError(error=="already_running"?409:400,"watch_start_failed",error);
-    JsonDocument out; out["ok"]=true; out["state"]="starting"; sendJson(202,out);
-  });
-  server.on("/api/v1/watch/stop", HTTP_POST, [](){
-    if (!requireAuth()) return;
-    stopWatchBridge(); JsonDocument out; out["ok"]=true; out["state"]="stopping"; sendJson(202,out);
-  });
-  server.on("/api/v1/context/reset", HTTP_POST, [](){
-    if (!requireAuth()) return;
-    resetWatchConversationContext("api_request");
-    JsonDocument out; out["ok"]=true; out["watchConversationTurns"]=0; sendJson(200,out);
-  });
-  auto chatHandler=[](){
-    if (!requireAuth()) return;
-    String b=body(); if (b.isEmpty()) return jsonError(400,"invalid_body","empty or too large");
-    JsonDocument in; if (deserializeJson(in,b)) return jsonError(400,"invalid_json","cannot parse json");
-    String prompt=in["prompt"]|"";
-    if (prompt.isEmpty() && in["messages"].is<JsonArray>()) {
-      JsonArray arr=in["messages"].as<JsonArray>();
-      for (JsonVariant v:arr) if (String(v["role"]|"")=="user") prompt=String((const char*)(v["content"]|""));
-    }
-    String answer,error; if (!mimoRequest(prompt,answer,error)) return jsonError(502,"mimo_error",error);
-    JsonDocument out; out["ok"]=true; out["model"]=model; out["content"]=answer; sendJson(200,out);
-  };
-  server.on("/api/v1/chat", HTTP_POST, chatHandler);
-  server.on("/api/v1/test", HTTP_POST, [](){
-    if (!requireAuth()) return;
-    String answer,error;
-    if (!mimoRequest("Reply with: Hoshino bridge OK",answer,error)) return jsonError(502,"mimo_error",error);
-    JsonDocument out; out["ok"]=true; out["model"]=model; out["content"]=answer; sendJson(200,out);
-  });
-  server.on("/setup/test", HTTP_POST, [](){
-    if (!requireSetupAp()) return;
-    String b=body(); JsonDocument in; if(!b.isEmpty()) deserializeJson(in,b); String prompt=in["prompt"]|"Reply with Hoshino bridge OK";
-    String answer,error; if(!mimoRequest(prompt,answer,error)) return jsonError(502,"mimo_error",error);
-    JsonDocument out; out["ok"]=true; out["content"]=answer; sendJson(200,out);
-  });
-  // 配网模式下作为 captive portal：把手机连上热点后自动弹出的探测请求
-  // 全部重定向到配置页，让手机浏览器自动打开配置界面。
+  const char* keys[] = {"Authorization", "X-Hoshino-Token", "X-Hoshino-Watch-Setup", "X-Hoshino-Storage"};
+  server.collectHeaders(keys, 4);
+  server.on("/", HTTP_GET, [](){ server.send_P(200, "text/html; charset=utf-8", kMinimalSetupWebUi); });
+  server.on("/setup/status", HTTP_GET, [](){ handlePhoneSetupStatus(); });
+  server.on("/setup", HTTP_POST, [](){ handlePhoneSetupSave(); });
+  // These watch-only provisioning routes intentionally do not alter SPP,
+  // virtual netif, DHCP, DNS, NAPT, or any Bluetooth/TCP tunnel code.
+  server.on("/watch-setup/status", HTTP_GET, [](){ handleWatchSetupStatus(); });
+  server.on("/watch-setup/scan", HTTP_GET, [](){ handleWatchSetupScan(); });
+  server.on("/watch-setup/wifi", HTTP_POST, [](){ handleWatchSetupWifi(); });
+  server.on("/api/v1/storage/status", HTTP_GET, [](){ handleStorageStatus(); });
+  server.on("/api/v1/storage/list", HTTP_GET, [](){ handleStorageList(); });
+  server.on("/api/v1/storage/file", HTTP_GET, [](){ handleStorageFile(); });
+  server.on("/api/v1/storage/chunk", HTTP_GET, [](){ handleStorageChunk(); });
   server.onNotFound([](){
     if (gSetupMode) {
       server.sendHeader("Location", "/", true);
       server.send(302, "text/plain", "redirect to setup");
       return;
     }
-    jsonError(404,"not_found",server.uri());
+    server.send(404, "text/plain; charset=utf-8", "not found\n");
   });
 }
 
@@ -5472,15 +5659,142 @@ void maintainMdns() {
   }
 }
 
-// ---- 配网模式（首次配置 / BOOT 长按触发） ----
+// ---- 配网模式（首次配置 / IO 短接触发） ----
 
 void setupTriggerPins() {
-  pinMode(kSetupTriggerPin, INPUT_PULLUP);
+  pinMode(kSetupTriggerPinOut, OUTPUT);
+  digitalWrite(kSetupTriggerPinOut, HIGH);  // 输出高电平
+  pinMode(kSetupTriggerPinIn, INPUT_PULLDOWN);  // 输入下拉
 }
 
 bool setupTriggered() {
-  // BOOT (GPIO0) is low only while pressed after normal application boot.
-  return digitalRead(kSetupTriggerPin) == LOW;
+  // GPIO17 被 GPIO16 短接后读到高电平。
+  return digitalRead(kSetupTriggerPinIn) == HIGH;
+}
+
+const char* wifiFailureName(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "wrong_password";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "network_not_found";
+    default:
+      return "connect_failed";
+  }
+}
+
+void handleWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    if (!gWifiStaConnecting && !gWifiProvisioningPending) return;
+    const uint8_t reason = info.wifi_sta_disconnected.reason;
+    gWifiStaLastReason = reason;
+    snprintf(gWifiError, sizeof(gWifiError), "%s", wifiFailureName(reason));
+    snprintf(gWifiState, sizeof(gWifiState), "%s", "error");
+    gWifiStaStopReconnectPending = true;
+    gWifiStaFailureBackoffUntilMs = millis() + kWifiStaFailureBackoffMs;
+    Serial.printf("WIFI_STA_FAILURE reason=%u error=%s backoff_ms=%lu\n",
+                  static_cast<unsigned>(reason), gWifiError,
+                  static_cast<unsigned long>(kWifiStaFailureBackoffMs));
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    gWifiStaLastReason = 0;
+    gWifiError[0] = '\0';
+    snprintf(gWifiState, sizeof(gWifiState), "%s", "connected");
+    gWifiStaStopReconnectPending = false;
+    gWifiStaFailureBackoffUntilMs = 0;
+  }
+}
+
+void beginWifiStaConnection(uint32_t timeoutMs) {
+  gWifiStaConnecting = true;
+  gWifiStaConnectDeadlineMs = millis() + (timeoutMs ? timeoutMs : kWifiStaConnectTimeoutMs);
+  gWifiStaStopReconnectPending = false;
+  gWifiStaFailureBackoffUntilMs = 0;
+  gWifiStaLastReason = 0;
+  gWifiError[0] = '\0';
+  snprintf(gWifiState, sizeof(gWifiState), "%s", "connecting");
+}
+
+void clearWifiStaConnection(const char* reason) {
+  if (gWifiStaConnecting) {
+    Serial.printf("WATCH_WIFI_STA_CONNECT_END reason=%s status=%d\n",
+                  reason ? reason : "unknown", static_cast<int>(WiFi.status()));
+  }
+  gWifiStaConnecting = false;
+  gWifiStaConnectDeadlineMs = 0;
+}
+
+void serviceWifiStaConnectionState(bool cancelled) {
+  if (gWifiStaStopReconnectPending) {
+    WiFi.setAutoReconnect(false);
+    gWifiStaStopReconnectPending = false;
+    gWifiStaConnecting = false;
+    gWifiStaConnectDeadlineMs = 0;
+    if (gWifiProvisioningPending) {
+      gWifiProvisioningPending = false;
+      gPendingWifiSsid = "";
+      gPendingWifiPassword = "";
+    }
+    Serial.printf("WIFI_STA_RECONNECT_STOPPED error=%s reason=%u\n",
+                  gWifiError[0] ? gWifiError : "connect_failed",
+                  static_cast<unsigned>(gWifiStaLastReason));
+    return;
+  }
+  if (!gWifiStaConnecting) return;
+  const wl_status_t state = WiFi.status();
+  const bool timedOut = static_cast<int32_t>(millis() - gWifiStaConnectDeadlineMs) >= 0;
+  const bool failed = state == WL_NO_SSID_AVAIL || state == WL_CONNECT_FAILED;
+  if (cancelled) {
+    clearWifiStaConnection("cancelled");
+    gWifiProvisioningPending = false;
+    gPendingWifiSsid = "";
+    gPendingWifiPassword = "";
+  } else if (state == WL_CONNECTED) {
+    clearWifiStaConnection("connected");
+    finishPendingWifiProvisioning(true);
+  } else if (failed) {
+    snprintf(gWifiState, sizeof(gWifiState), "%s", "error");
+    if (!gWifiError[0]) snprintf(gWifiError, sizeof(gWifiError), "%s",
+                                 state == WL_NO_SSID_AVAIL ? "network_not_found" : "connect_failed");
+    WiFi.setAutoReconnect(false);
+    clearWifiStaConnection("failed");
+    finishPendingWifiProvisioning(false);
+  } else if (timedOut) {
+    snprintf(gWifiState, sizeof(gWifiState), "%s", "timeout");
+    snprintf(gWifiError, sizeof(gWifiError), "%s", "connect_timeout");
+    WiFi.setAutoReconnect(false);
+    clearWifiStaConnection("timeout");
+    finishPendingWifiProvisioning(false);
+  }
+}
+
+void finishPendingWifiProvisioning(bool connected) {
+  if (!gWifiProvisioningPending) return;
+  const String pendingSsid = gPendingWifiSsid;
+  const String pendingPass = gPendingWifiPassword;
+  gWifiProvisioningPending = false;
+  gPendingWifiSsid = "";
+  gPendingWifiPassword = "";
+  if (!connected) return;
+
+  const String oldSsid = ssid;
+  const String oldPass = wifiPass;
+  const bool ssidSaved = prefs.putString("ssid", pendingSsid) == pendingSsid.length();
+  const bool passSaved = prefs.putString("wifi_pass", pendingPass) == pendingPass.length();
+  if (!ssidSaved || !passSaved) {
+    prefs.putString("ssid", oldSsid);
+    prefs.putString("wifi_pass", oldPass);
+    snprintf(gWifiState, sizeof(gWifiState), "%s", "error");
+    snprintf(gWifiError, sizeof(gWifiError), "%s", "wifi_config_save_failed");
+    return;
+  }
+  ssid = pendingSsid;
+  wifiPass = pendingPass;
+  gWifiError[0] = '\0';
+  snprintf(gWifiState, sizeof(gWifiState), "%s", "connected");
+  Serial.printf("WATCH_WIFI_SETUP_SAVED ssid_bytes=%u\n",
+                static_cast<unsigned>(ssid.length()));
 }
 
 void enterSetupMode() {
@@ -5489,6 +5803,7 @@ void enterSetupMode() {
   gWatchAutoReconnectSuppressed = true;
   WiFi.mode(WIFI_AP);
   const bool apStarted = WiFi.softAP(kApSsid, apPassword.c_str());
+  gSoftApActive = apStarted;
   if (!gServerStarted) {
     server.begin();
     gServerStarted = true;
@@ -5498,7 +5813,7 @@ void enterSetupMode() {
                 apStarted ? "true" : "false");
 }
 
-// 独立任务检测 BOOT 长按：不依赖 loop()，因此即使 authenticateWatchSpp
+// 独立任务检测 GPIO 短接：不依赖 loop()，因此即使 authenticateWatchSpp
 // 同步阻塞了 Arduino 主循环，这个任务仍能触发配网。
 static void setupTriggerTask(void*) {
   uint32_t since = 0;
@@ -5508,7 +5823,7 @@ static void setupTriggerTask(void*) {
       else if (millis() - since >= kSetupTriggerHoldMs) {
         // 不在运行时切换 WiFi（STA→AP 会因内存/状态问题失败）。
         // 改为写入标志并重启，重启后在干净 boot 环境直接进入 AP 配网模式。
-        Serial.println("SETUP_MODE_REASON boot_long_press (save flag + reboot)");
+        Serial.println("SETUP_MODE_REASON io_short (save flag + reboot)");
         prefs.putBool("force_setup", true);
         delay(300);  // 让 NVS 标志落盘
         ESP.restart();
@@ -5527,25 +5842,27 @@ void connectWifi() {
   // SoftAP netif does not consume the heap the Bluetooth controller needs.
   // The setup AP is only enabled when no Wi-Fi has been configured yet.
   if (ssid.isEmpty()) {
+    clearWifiStaConnection("ap_mode");
     WiFi.mode(WIFI_AP);
     const bool apStarted = WiFi.softAP(kApSsid, apPassword.c_str());
+    gSoftApActive = apStarted;
     Serial.printf("SoftAP started=%s ssid=%s ap=%s (no home wifi configured)\n",
                   apStarted ? "true" : "false", kApSsid, WiFi.softAPIP().toString().c_str());
     return;
   }
-  // 认证/bootstrap 阶段可能已经非阻塞地启动过 STA（WiFi.mode+begin）。
-  // 核心的 lowLevelInitDone 会守护 esp_wifi_init 不被重复调用，这里直接
-  // 复用 Hoshino 原版的 mode()+begin() 即可。
+  gSoftApActive = false;
   WiFi.mode(WIFI_STA);
+  beginWifiStaConnection(kWifiStaConnectTimeoutMs);
   WiFi.begin(ssid.c_str(), wifiPass.c_str());
-  uint32_t start=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-start<60000){delay(250);}
+  uint32_t start=millis();
+  while(WiFi.status()!=WL_CONNECTED && gWifiStaConnecting && millis()-start<60000){
+    serviceWifiStaConnectionState(false);
+    delay(250);
+  }
+  clearWifiStaConnection(WiFi.status()==WL_CONNECTED ? "connected" : "wait_end");
   Serial.printf("STA mode connected=%s ip=%s\n",
                 WiFi.status() == WL_CONNECTED ? "true" : "false",
                 WiFi.localIP().toString().c_str());
-  if (WiFi.status() == WL_CONNECTED) {
-    gWatchInternetRouteReady = false;
-    requestWatchInternetRouteRepair();
-  }
   // mDNS is started lazily from loop() after the Bluetooth bridge has
   // initialised, to keep heap available for the Bluetooth controller.
 }
@@ -5553,15 +5870,11 @@ void connectWifi() {
 
 void setup() {
   Serial.begin(2000000);
-  // In the ESP-IDF+Arduino low-memory environment, true preserves the tiny
-  // sdkconfig Wi-Fi buffer counts instead of Arduino's large dynamic default.
-  // In the pure-Arduino fallback, use dynamic buffers to avoid reserving the
-  // precompiled framework's much larger static TX pool up front.
-#ifdef HOSHINO_LOW_MEMORY_SDKCONFIG
+  WiFi.onEvent(handleWifiEvent);
+  // Use the sdkconfig WiFi buffer counts (dynamic RX/TX = 8) instead of the
+  // Arduino default hardcoded 32. Arduino's WiFiGeneric.cpp overrides the
+  // sdkconfig values with 32 unless useStaticBuffers(true) is set before init.
   WiFi.useStaticBuffers(true);
-#else
-  WiFi.useStaticBuffers(false);
-#endif
   // Initialize the TCP/IP stack before any Bluetooth or network operations.
   // The tcpip thread is needed for tcpip_callback() used by the network bridge
   // (setupWatchNetworkProxy), which is called during Bluetooth auth, before
@@ -5582,29 +5895,14 @@ void setup() {
   // beginWatchBluetooth() succeeds (see ensureScratchBuffers()).
   loadConfig();
   setupTriggerPins();
-  // 板载心跳 LED（D2/GPIO2）
-  pinMode(kHeartbeatLedPin, OUTPUT);
-  digitalWrite(kHeartbeatLedPin, LOW);
-  // OLED/Wire also consume and fragment heap. If this is a configured normal
-  // boot, defer their initialization until STA has obtained an IP; Bluetooth
-  // auth + Wi-Fi init get the cleanest possible WROOM heap. In first-setup AP
-  // mode we can initialize the display immediately because no Classic-BT bridge
-  // is competing for RAM.
-  const bool displayCanStartEarly = ssid.isEmpty() ||
-                                    watchMac.length() != 17 ||
-                                    watchAuthKey.length() != 32;
-  if (displayCanStartEarly) {
-    initDisplay();
-  } else {
-    gDisplayInitDeferred = true;
-    Serial.println("DISPLAY_INIT_DEFERRED until=wifi_got_ip");
-  }
   // 独立任务检测 GPIO 短接（不依赖被桥接阻塞的 loop()）。
   xTaskCreatePinnedToCore(setupTriggerTask, "hoshino_setup_trig", 2048, nullptr, 1, nullptr, 1);
   if (!gBridgeStateMutex) gBridgeStateMutex = xSemaphoreCreateMutex();
   // ASR result queue is optional; scheduleWatchAsrJob() allocates it lazily.
+#if HOSHINO_ENABLE_ASR
   gWatchStreamCaptureFsReady = false;  // mounted lazily on first capture
   Serial.printf("WATCH_CAPTURE_FS lazy_mount=%s\n", gWatchStreamCaptureFsReady ? "true" : "false");
+#endif
   // Wi-Fi is NOT connected here: it is brought up inside watchBridgeTaskMain
   // AFTER Bluetooth auth succeeds, to keep heap large/unfragmented for BT init.
   setupRoutes();
@@ -5613,7 +5911,7 @@ void setup() {
   Serial.printf("Hoshino Bridge ready. watch_configured=%s\n",
                 (watchMac.length()==17 && watchAuthKey.length()==32) ? "true" : "false");
 
-  // BOOT 长按触发的强制配网：重启后检测到标志，直接进入 SoftAP 配网模式。
+  // IO 短接触发的强制配网：重启后检测到标志，直接进入 SoftAP 配网模式。
   if (prefs.getBool("force_setup", false)) {
     prefs.putBool("force_setup", false);  // 清除一次性标志
     Serial.println("SETUP_MODE_REASON io_short_reboot");
@@ -5621,8 +5919,9 @@ void setup() {
     return;
   }
 
-  // 首次配网：完全没有 Wi-Fi 配置（或缺少手表 key）时，直接进入 SoftAP 配网模式。
-  const bool needSetup = ssid.isEmpty() || watchMac.length() != 17 || watchAuthKey.length() != 32;
+  // 首次配网：缺少完整 Watch 身份时进入 SoftAP。家庭 Wi-Fi 可以为空，
+  // 这样已配置手表身份的设备仍会先启动原始蓝牙桥接并提供隧道配网接口。
+  const bool needSetup = watchMac.length() != 17 || watchAuthKey.length() != 32;
   if (needSetup) {
     Serial.println("SETUP_MODE_REASON first_boot_no_config");
     enterSetupMode();
@@ -5642,23 +5941,6 @@ void setup() {
 void loop() {
   handleWatchProbeSerial();
 
-  // Normal configured boot defers OLED allocation until Wi-Fi is actually up,
-  // so the Bluetooth controller and esp_wifi_init see an unfragmented heap.
-  if (!gDisplayReady && gDisplayInitDeferred && WiFi.status() == WL_CONNECTED) {
-    gDisplayInitDeferred = false;
-    initDisplay();
-  }
-
-  // OLED 状态屏：节流刷新，覆盖配网/正常两种模式（配网分支会提前 return）。
-  if (gDisplayReady && static_cast<int32_t>(millis() - gLastDisplayMs) >=
-                           static_cast<int32_t>(kDisplayRefreshMs)) {
-    gLastDisplayMs = millis();
-    renderDisplay();
-  }
-
-  // 心跳 LED：必须在配网分支 return 之前调用，否则配网模式下灯不闪。
-  serviceHeartbeatLed();
-
   // 配网模式：仅服务 AP 上的 HTTP 配置页面，不做桥接/重连。
   if (gSetupMode) {
     if (gServerStarted) server.handleClient();
@@ -5666,8 +5948,8 @@ void loop() {
     return;
   }
 
-  // 正常工作模式：启动 HTTP 服务器（STA 连接后）。
-  if (!gServerStarted && WiFi.status() == WL_CONNECTED) {
+  // 正常工作模式：STA 或已认证的手表虚拟网络就绪后启动 HTTP 服务器。
+  if (!gServerStarted && (gSoftApActive || gWatchNetworkReady || WiFi.status() == WL_CONNECTED)) {
     server.begin();
     gServerStarted = true;
     Serial.println("HOSHINO_HTTP_SERVER_STARTED");
@@ -5675,7 +5957,7 @@ void loop() {
   if (gServerStarted) server.handleClient();
   maintainMdns();
 
-  // BOOT 长按触发配网已由独立任务 setupTriggerTask 处理（不依赖本循环）。
+  // IO 短接触发配网已由独立任务 setupTriggerTask 处理（不依赖本循环）。
 
   if (autoConnectWatch && !gWatchAutoReconnectSuppressed &&
       !gWatchBridgeRunning && !gWatchBridgeTask &&

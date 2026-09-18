@@ -1,0 +1,32 @@
+{
+  "package": "com.hoshino.app",
+  "name": "wifi连接器",
+  "versionName": "2.0.14",
+  "versionCode": 17,
+  "minPlatformVersion": 1200,
+  "icon": "/common/logo.png",
+  "deviceTypeList": [
+    "watch"
+  ],
+  "features": [
+    {
+      "name": "system.fetch"
+    },
+    {
+      "name": "system.vibrator"
+    }
+  ],
+  "config": {
+    "logLevel": "log",
+    "designWidth": 432
+  },
+  "router": {
+    "entry": "pages/wifi_setup",
+    "pages": {
+      "pages/wifi_setup": {
+        "component": "wifi_setup"
+      }
+    }
+  },
+  "minAPILevel": 1
+}

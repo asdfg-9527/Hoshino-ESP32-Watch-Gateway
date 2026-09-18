@@ -1,0 +1,338 @@
+<import name="input-method" src="../../components/InputMethod/InputMethod.ux"></import>
+<template>
+  <div class="watch-page">
+    <text class="connection-status">{{ connectionStatus }}</text>
+
+    <div if="{{page === 'scan'}}" class="scan-page">
+      <div class="scan-header">
+        <text class="scan-title">WIFI扫描</text>
+        <input type="button" class="blue-button scan-button" value="扫描" @click="scanWifi" />
+      </div>
+
+      <text class="status-message" style="color: {{scanStatusColor}};">{{ scanMessage }}</text>
+      <text class="wifi-status-message" style="color: {{wifiStatusColor}};">{{ wifiStatusMessage }}</text>
+
+      <list class="wifi-list">
+        <list-item for="{{wifiNetworks}}" class="wifi-row" type="wifi-row">
+          <div class="wifi-card">
+            <div class="wifi-copy">
+              <text class="wifi-name">{{$item.ssid}}</text>
+              <text class="wifi-rssi">{{$item.rssi}} dBm</text>
+            </div>
+            <input type="button" class="blue-button select-button" value="选择" @click="selectWifi($idx)" />
+          </div>
+        </list-item>
+      </list>
+    </div>
+
+    <div if="{{page === 'password'}}" class="password-page">
+      <input type="button" class="blue-button back-button" value="返回" @click="backToScan" />
+
+      <div class="selected-card">
+        <text class="selected-name">{{ selectedSsid }}</text>
+        <input type="button" class="blue-button confirm-button" value="确定" @click="submitWifi" />
+        <text if="{{password.length === 0}}" class="password-field password-placeholder" @click="showPasswordKeyboard">Wi-Fi 密码（至少 8 位）</text>
+        <text else class="password-field password-value" @click="showPasswordKeyboard">{{ password }}</text>
+      </div>
+
+      <text class="status-message upload-message" style="color: {{uploadStatusColor}};">{{ uploadMessage }}</text>
+      <input-method
+        hide="{{passwordKeyboardHidden}}"
+        keyboardtype="QWERTY"
+        screentype="rect"
+        @visibility-change="onPasswordKeyboardVisibilityChange"
+        @key-down="onPasswordKeyDown"
+        @delete="onPasswordDelete"
+        @complete="onPasswordComplete"
+      ></input-method>
+    </div>
+
+  </div>
+</template>
+
+<script>
+import vibrator from '@system.vibrator'
+import { cancelAll, watchSetupScan, watchSetupStatus, watchSetupWifi } from '../../common/esp32_bridge'
+
+const MAX_SCAN_ROWS = 64
+const MAX_WIFI_NETWORKS = 20
+
+function errorText(data, code) {
+  if (data && typeof data === 'object') {
+    return String(data.message || data.error || code || 'request_failed')
+  }
+  return String(data || code || 'request_failed')
+}
+
+function wifiErrorText(error) {
+  if (error === 'wrong_password') return 'Wi-Fi 密码错误，请重新输入'
+  if (error === 'network_not_found') return '未找到该 Wi-Fi'
+  if (error === 'connect_timeout') return 'Wi-Fi 连接超时，请稍后重试'
+  if (error === 'connect_failed') return 'Wi-Fi 连接失败，请检查网络设置'
+  return ''
+}
+
+function haptic() {
+  try {
+    if (vibrator && typeof vibrator.vibrate === 'function') {
+      vibrator.vibrate({ mode: 'short' })
+    }
+  } catch (ignore) {}
+}
+
+export default {
+  private: {
+    page: 'scan',
+    connectionStatus: '连接中…',
+    scanMessage: '点击扫描',
+    scanStatusColor: '#999999',
+    wifiStatusMessage: 'Wi-Fi：状态读取中…',
+    wifiStatusColor: '#999999',
+    wifiNetworks: [],
+    selectedSsid: '',
+    password: '',
+    passwordKeyboardHidden: true,
+    passwordInputFocused: false,
+    uploadMessage: '',
+    uploadStatusColor: '#999999',
+    scanInProgress: false,
+    provisionPollTimer: null
+  },
+  onInit() {
+    this.checkConnection()
+  },
+  onDestroy() {
+    this.passwordKeyboardHidden = true
+    if (this.provisionPollTimer) clearTimeout(this.provisionPollTimer)
+    cancelAll()
+  },
+  checkConnection() {
+    watchSetupStatus({
+      success: (data) => {
+        if (!this.$valid) return
+        this.updateWifiStatus(data)
+        const wifiError = wifiErrorText(data && data.wifiError)
+        this.connectionStatus = wifiError
+          ? wifiError
+          : (data && data.watchTunnel ? '已连接esp32' : 'ESP32 未连接')
+      },
+      fail: (data, code) => {
+        if (!this.$valid) return
+        this.connectionStatus = 'ESP32 连接失败：' + errorText(data, code)
+      }
+    })
+  },
+  updateWifiStatus(data) {
+    const connected = Boolean(data && data.wifiConnected)
+    const state = String(data && (data.wifiState || data.status) || '')
+    const hasSsid = data && data.ssid !== undefined && data.ssid !== null
+    const ssid = hasSsid ? String(data.ssid) : ''
+    if (connected) {
+      this.wifiStatusMessage = 'Wi-Fi：已连接 SSID：' + ssid
+      this.wifiStatusColor = '#00ff00'
+      return
+    }
+    if (state === 'connecting' || state === 'wifi_connecting') {
+      this.wifiStatusMessage = ssid ? 'Wi-Fi：连接中 SSID：' + ssid : 'Wi-Fi：连接中'
+      this.wifiStatusColor = '#ffffff'
+      return
+    }
+    this.wifiStatusMessage = 'Wi-Fi：未连接'
+    this.wifiStatusColor = '#ffcc00'
+  },
+  scanWifi() {
+    haptic()
+    if (this.scanInProgress) return
+    this.scanInProgress = true
+    this.scanMessage = '正在扫描…'
+    this.scanStatusColor = '#ffffff'
+    watchSetupScan({
+      success: (data) => {
+        if (!this.$valid) return
+        if (data && data.status === 'wifi_connecting') {
+          this.scanMessage = String(data.message || 'Wi-Fi 正在连接，稍候自动重试…')
+          this.scanStatusColor = '#ffffff'
+          return
+        }
+        this.scanInProgress = false
+        const rows = data && Array.isArray(data.networks) ? data.networks : []
+        const nextNetworks = []
+        const inspectCount = Math.min(rows.length, MAX_SCAN_ROWS)
+        for (let i = 0; i < inspectCount; i += 1) {
+          const item = rows[i]
+          const ssid = String(item && item.ssid || '')
+          if (!ssid) continue
+          let duplicate = false
+          for (let j = 0; j < nextNetworks.length; j += 1) {
+            if (nextNetworks[j].ssid === ssid) {
+              duplicate = true
+              break
+            }
+          }
+          if (duplicate) continue
+          nextNetworks.push({ ssid, rssi: Number(item && item.rssi || 0) })
+        }
+        nextNetworks.sort((a, b) => b.rssi - a.rssi)
+        this.wifiNetworks = nextNetworks.slice(0, MAX_WIFI_NETWORKS)
+        this.scanMessage = String(data && (data.message || data.statusMessage) || '扫描成功')
+        this.scanStatusColor = '#00ff00'
+        this.checkConnection()
+      },
+      fail: (data, code) => {
+        if (!this.$valid) return
+        this.scanInProgress = false
+        this.wifiNetworks = []
+        this.scanMessage = '扫描失败：' + errorText(data, code)
+        this.scanStatusColor = '#ff0000'
+      }
+    })
+  },
+  selectWifi(index) {
+    const item = this.wifiNetworks[Number(index)]
+    if (!item || !item.ssid) return
+    haptic()
+    this.selectedSsid = item.ssid
+    this.password = ''
+    this.passwordKeyboardHidden = true
+    this.passwordInputFocused = false
+    this.uploadMessage = ''
+    this.uploadStatusColor = '#999999'
+    this.page = 'password'
+  },
+  backToScan() {
+    haptic()
+    this.passwordKeyboardHidden = true
+    this.page = 'scan'
+  },
+  showPasswordKeyboard() {
+    if (this.page !== 'password') return
+    haptic()
+    this.passwordInputFocused = true
+    this.passwordKeyboardHidden = false
+  },
+  onPasswordKeyboardVisibilityChange(evt) {
+    const visible = Boolean(evt && evt.detail && evt.detail.visible)
+    this.passwordKeyboardHidden = !visible
+  },
+  onPasswordKeyDown(evt) {
+    // The upstream component emits key-down for the physical key press and
+    // complete for the committed character. Append only on complete to avoid
+    // duplicating English characters.
+    this.passwordInputFocused = Boolean(evt)
+  },
+  onPasswordComplete(evt) {
+    const content = String(evt && evt.detail && evt.detail.content !== undefined ? evt.detail.content : '')
+    if (!content || this.password.length >= 128) return
+    this.password = (this.password + content).slice(0, 128)
+  },
+  onPasswordDelete() {
+    this.password = this.password.slice(0, -1)
+  },
+  submitWifi() {
+    haptic()
+    if (!this.selectedSsid) {
+      this.uploadMessage = '上传失败：Wi-Fi 名称不能为空'
+      this.uploadStatusColor = '#ff0000'
+      return
+    }
+    if (this.selectedSsid.length > 64) {
+      this.uploadMessage = '上传失败：Wi-Fi 名称过长'
+      this.uploadStatusColor = '#ff0000'
+      return
+    }
+    if (this.password.length < 8) {
+      this.uploadMessage = '上传失败：Wi-Fi 密码至少需要 8 位'
+      this.uploadStatusColor = '#ff0000'
+      return
+    }
+    if (this.password.length > 128) {
+      this.uploadMessage = '上传失败：Wi-Fi 密码过长'
+      this.uploadStatusColor = '#ff0000'
+      return
+    }
+    this.passwordKeyboardHidden = true
+    this.uploadMessage = '正在上传…'
+    this.uploadStatusColor = '#ffffff'
+    watchSetupWifi(this.selectedSsid, this.password, {
+      success: (data) => {
+        if (!this.$valid) return
+        this.updateWifiStatus(data)
+        if (data && data.status !== 'connecting' && data.status !== 'connected') {
+          this.uploadMessage = String(data.message || data.status || 'Wi-Fi 连接失败')
+          this.uploadStatusColor = '#ff0000'
+          return
+        }
+        this.uploadMessage = '正在连接 Wi-Fi…'
+        this.uploadStatusColor = '#ffffff'
+        this.pollWifiProvisioning(Date.now() + 20000)
+      },
+      fail: (data, code) => {
+        if (!this.$valid) return
+        this.uploadMessage = '上传失败：' + errorText(data, code)
+        this.uploadStatusColor = '#ff0000'
+      }
+    })
+  },
+  pollWifiProvisioning(deadline) {
+    if (!this.$valid) return
+    watchSetupStatus({
+      success: (data) => {
+        if (!this.$valid) return
+        this.updateWifiStatus(data)
+        const state = String(data && (data.wifiState || data.status) || '')
+        const error = String(data && data.wifiError || '')
+        if (state === 'connected' && data && data.wifiConnected) {
+          this.password = ''
+          this.uploadMessage = 'Wi-Fi 连接成功'
+          this.uploadStatusColor = '#00ff00'
+          return
+        }
+        if (error || state === 'error' || state === 'timeout') {
+          this.uploadMessage = '上传失败：' + (wifiErrorText(error) || errorText(data, 0))
+          this.uploadStatusColor = '#ff0000'
+          return
+        }
+        if (Date.now() >= deadline) {
+          this.uploadMessage = '上传失败：Wi-Fi 连接超时，请稍后重试'
+          this.uploadStatusColor = '#ff0000'
+          return
+        }
+        this.provisionPollTimer = setTimeout(() => this.pollWifiProvisioning(deadline), 500)
+      },
+      fail: (data, code) => {
+        if (!this.$valid) return
+        this.uploadMessage = '上传失败：' + errorText(data, code)
+        this.uploadStatusColor = '#ff0000'
+      }
+    })
+  }
+}
+</script>
+
+<style>
+.watch-page { width: 432px; height: 514px; background-color: #000000; border-radius: 103px; overflow: hidden; position: relative; }
+.connection-status { position: absolute; top: 5px; left: 0px; width: 432px; height: 27px; color: #ffffff; font-size: 21px; font-weight: bold; text-align: center; }
+.scan-page { width: 432px; height: 514px; }
+.scan-header { position: absolute; top: 36px; left: 35px; width: 363px; height: 75px; border-radius: 15px; background-color: #3a3a3a; flex-direction: row; align-items: center; }
+.scan-title { margin-left: 27px; color: #ffffff; font-size: 38px; font-weight: bold; }
+.blue-button { color: #ffffff; background-color: #2d6cdf; border-color: #2d6cdf; border-radius: 22px; font-size: 20px; font-weight: bold; }
+.scan-button { position: absolute; right: 26px; top: 19px; width: 85px; height: 38px; }
+.status-message { position: absolute; left: 42px; top: 115px; width: 345px; height: 28px; font-size: 22px; font-weight: bold; lines: 1; }
+.wifi-status-message { position: absolute; left: 42px; top: 141px; width: 345px; height: 26px; font-size: 18px; font-weight: bold; lines: 1; text-overflow: ellipsis; }
+.wifi-list { position: absolute; left: 35px; top: 169px; width: 363px; height: 330px; background-color: transparent; }
+.wifi-row { width: 363px; height: 74px; margin-bottom: 0px; }
+.wifi-card { width: 363px; height: 73px; border-radius: 15px; background-color: #3a3a3a; flex-direction: row; align-items: center; }
+.wifi-copy { margin-left: 27px; flex-direction: column; }
+.wifi-name { color: #ffffff; font-size: 22px; font-weight: bold; height: 30px; lines: 1; text-overflow: ellipsis; }
+.wifi-rssi { color: #ffffff; font-size: 22px; font-weight: bold; height: 30px; }
+.select-button { position: absolute; right: 26px; width: 85px; height: 38px; }
+.password-page { width: 432px; height: 514px; }
+.back-button { position: absolute; left: 35px; top: 36px; width: 85px; height: 38px; }
+.selected-card { position: absolute; left: 35px; top: 95px; width: 363px; height: 103px; border-radius: 15px; background-color: #3a3a3a; }
+.selected-name { position: absolute; left: 19px; top: 14px; width: 268px; height: 30px; color: #ffffff; font-size: 22px; font-weight: bold; lines: 1; text-overflow: ellipsis; }
+.confirm-button { position: absolute; right: 26px; top: 8px; width: 85px; height: 38px; }
+.password-field { position: absolute; left: 18px; top: 56px; width: 327px; height: 38px; border-radius: 13px; background-color: #aaaaaa; color: #111111; font-size: 20px; padding-left: 10px; padding-top: 8px; lines: 1; text-overflow: ellipsis; }
+.password-placeholder { color: #333333; }
+.password-value { color: #111111; }
+.upload-message { top: 210px; }
+</style>

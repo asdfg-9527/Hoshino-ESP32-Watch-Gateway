@@ -1,0 +1,191 @@
+<template>
+  <div if="{{!hide}}" class="input-method">
+    <div class="input-toolbar">
+      <text class="mode-button" @click="toggleNumberMode">{{numFlag ? 'ABC' : '123'}}</text>
+      <text class="toolbar-title">QWERTY</text>
+      <text class="delete-button" @click="deleteInput">Del</text>
+      <text class="complete-button" @click="completeInput">Done</text>
+    </div>
+
+    <div if="{{!numFlag}}" class="key-row row-top">
+      <text class="key" for="{{key in keys.alpha[0]}}" @click="selectKey(key)">{{upperFlag ? key : key.toLowerCase()}}</text>
+    </div>
+    <div if="{{!numFlag}}" class="key-row row-middle">
+      <text class="key" for="{{key in keys.alpha[1]}}" @click="selectKey(key)">{{upperFlag ? key : key.toLowerCase()}}</text>
+    </div>
+    <div if="{{!numFlag}}" class="key-row row-bottom">
+      <text class="key" for="{{key in keys.alpha[2]}}" @click="selectKey(key)">{{upperFlag ? key : key.toLowerCase()}}</text>
+    </div>
+    <div if="{{!numFlag}}" class="utility-row">
+      <text class="utility-key case-button" @click="toggleCase">{{upperFlag ? 'lower' : 'UPPER'}}</text>
+      <text class="utility-key space-button" @click="selectKey(' ')" >Space</text>
+      <text class="utility-key symbol-button" @click="toggleNumberMode">123</text>
+    </div>
+
+    <div if="{{numFlag}}" class="key-row row-top">
+      <text class="key" for="{{key in keys.symbols[0]}}" @click="selectKey(key)">{{key}}</text>
+    </div>
+    <div if="{{numFlag}}" class="key-row row-middle">
+      <text class="key" for="{{key in keys.symbols[1]}}" @click="selectKey(key)">{{key}}</text>
+    </div>
+    <div if="{{numFlag}}" class="key-row row-bottom">
+      <text class="key" for="{{key in keys.symbols[2]}}" @click="selectKey(key)">{{key}}</text>
+    </div>
+    <div if="{{numFlag}}" class="utility-row">
+      <text class="utility-key case-button" @click="toggleNumberMode">ABC</text>
+      <text class="utility-key space-button" @click="selectKey(' ')" >Space</text>
+      <text class="utility-key symbol-button" @click="deleteInput">Del</text>
+    </div>
+  </div>
+</template>
+
+<script>
+import vibrator from '@system.vibrator'
+
+function haptic() {
+  try {
+    if (vibrator && typeof vibrator.vibrate === 'function') {
+      vibrator.vibrate({ mode: 'short' })
+    }
+  } catch (ignore) {}
+}
+
+export default {
+  props: {
+    hide: { default: true },
+    keyboardtype: { default: 'QWERTY' },
+    screentype: { default: 'rect' }
+  },
+  data: {
+    numFlag: false,
+    upperFlag: true,
+    keys: {
+      alpha: [
+        ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+        ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'],
+        ['Z', 'X', 'C', 'V', 'B', 'N', 'M']
+      ],
+      symbols: [
+        ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
+        ['~', '!', '@', '#', '$', '%', '^', '&', '*', '?'],
+        ['(', ')', '-', '_', ':', ';', '.', ',', '/']
+      ]
+    }
+  },
+  onInit() {
+    this.$watch('hide', 'watchHidePropsChange')
+  },
+  watchHidePropsChange(newValue) {
+    this.$emit('visibilityChange', { visible: !newValue })
+  },
+  selectKey(key) {
+    haptic()
+    const rawContent = String(key)
+    const isAsciiLetter = /^[A-Za-z]$/.test(rawContent)
+    const content = isAsciiLetter
+      ? (this.upperFlag ? rawContent.toUpperCase() : rawContent.toLowerCase())
+      : rawContent
+    this.$emit('keyDown', { content })
+    this.$emit('complete', { content })
+  },
+  deleteInput() {
+    haptic()
+    this.$emit('delete', {})
+  },
+  toggleCase() {
+    haptic()
+    this.upperFlag = !this.upperFlag
+  },
+  toggleNumberMode() {
+    haptic()
+    this.numFlag = !this.numFlag
+  },
+  completeInput() {
+    haptic()
+    this.$emit('visibilityChange', { visible: false })
+    this.$emit('complete', { content: '' })
+  }
+}
+</script>
+
+<style>
+.input-method {
+  position: absolute;
+  left: 0px;
+  bottom: 0px;
+  width: 432px;
+  background-color: #101010;
+  flex-direction: column;
+  padding: 6px 8px 8px 8px;
+  z-index: 20;
+}
+.input-toolbar {
+  width: 416px;
+  height: 42px;
+  flex-direction: row;
+  align-items: center;
+}
+.toolbar-title {
+  flex: 1;
+  color: #a8a8a8;
+  font-size: 17px;
+  text-align: center;
+}
+.mode-button, .delete-button, .complete-button {
+  height: 34px;
+  min-width: 52px;
+  color: #ffffff;
+  background-color: #303030;
+  border-radius: 10px;
+  font-size: 17px;
+  text-align: center;
+  padding: 7px 8px 0px 8px;
+}
+.complete-button {
+  color: #ffffff;
+  background-color: #2d6cdf;
+}
+.delete-button { margin-right: 6px; }
+.key-row {
+  width: 416px;
+  height: 52px;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+}
+.key {
+  width: 39px;
+  height: 46px;
+  margin: 2px;
+  color: #ffffff;
+  background-color: #262626;
+  border-radius: 10px;
+  border: 2px solid #333333;
+  font-size: 24px;
+  text-align: center;
+  padding-top: 7px;
+}
+.row-middle { padding-left: 20px; padding-right: 20px; }
+.row-bottom { padding-left: 52px; padding-right: 52px; }
+.utility-row {
+  width: 416px;
+  height: 50px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+.utility-key {
+  height: 42px;
+  color: #ffffff;
+  background-color: #262626;
+  border-radius: 10px;
+  border: 2px solid #333333;
+  font-size: 17px;
+  text-align: center;
+  padding-top: 8px;
+  margin: 3px;
+}
+.case-button { width: 82px; }
+.space-button { width: 190px; }
+.symbol-button { width: 82px; }
+</style>

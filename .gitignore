@@ -1,20 +1,40 @@
-# PlatformIO build output
+# Build output and caches
 .pio/
+**/.pio/
+~
+*/~
+node_modules/
+**/node_modules/
+build/
+**/build/
+dist/
+**/dist/
+logs/
+**/logs/
+
+# Firmware and package artifacts
+*.bin
+*.rpk
+*.elf
+*.map
+*.hex
+*.zip
+!archive/
+!archive/archive-Hoshino-ESP32-v2026.08.19-source-only.zip
+
+# Signing material and local secrets
+sign/
+**/sign/
+*.pem
+*.p12
+*.jks
+watch_secret_local.h
+**/watch_secret_local.h
+signing.*
+**/signing.*
+
+# Local tooling/editor files
 .vscode/
 .idea/
-
-# ESP-IDF generated config (keep only the defaults template)
-sdkconfig
-sdkconfig.old
-sdkconfig.*.old
-sdkconfig.wroom_lowmem_idf
-sdkconfig.esp32dev
-
-# Firmware binaries
-*.bin
-*.elf
-*.hex
-
-# OS / editor
 .DS_Store
 Thumbs.db

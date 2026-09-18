@@ -1,122 +1,31 @@
-# Hoshino ESP32 Watch Gateway
+# Hoshino Watch Gateway
 
-让一块经典双核 ESP32（含 Bluetooth Classic）长期充当 Redmi Watch 6 的「手机侧网络网关」：
+This repository contains the source for the Hoshino ESP32 gateway and its Xiaomi Vela QuickApp.
 
-- 手表通过蓝牙 SPP 连接 ESP32；
-- ESP32 在内部架起一块虚拟网卡，为手表提供 DHCP（`10.1.10.2/24`）；
-- 手表的 IPv4 流量经 lwIP NAPT 转发到家庭 Wi-Fi，实现真实联网；
-- 配网页面提供家庭 Wi-Fi 与附近经典蓝牙设备扫描，手动填写 AuthKey 后完成配置。
+## Layout
 
-本仓库只包含**固件源码**。私有协议的逆向过程与抓包数据不在此公开。
+- `esp32/` — current ESP32 gateway source, PlatformIO/ESP-IDF configuration, lwIP override, tests, and development notes.
+- `quickapp/` — current QuickApp source, manifest/package metadata, input method, and contract tests.
+- `archive/archive-Hoshino-ESP32-v2026.08.19-source-only.zip` — source-only snapshot of the previous remote version.
 
----
+Firmware and package outputs are intentionally excluded from Git. This includes `.bin`, `.rpk`, `.elf`, `.map`, build directories, caches, signing material, and local secrets.
 
-## 功能特性
+## Build locally
 
-- **首次配网**：无任何配置时自动开启 `Vela-Bridge` 热点，手机连上后扫描并选择 Wi-Fi 与手表。
-- **网页配置**：内置最小配网页面：Wi-Fi、经典蓝牙设备选择、AuthKey 与热点密码。
-- **网络桥（NAPT）**：手表 `ch7` 原始 IPv4 → 虚拟网卡 → lwIP NAPT → 家庭 Wi-Fi → 互联网，支持 DNS/TCP/HTTP/TLS。
-- **蓝牙扫描**：扫描附近 Bluetooth Classic 设备，点击结果自动填入 MAC；不会自动配对或连接。
-- **BOOT 长按重新配网**：正常运行后长按 BOOT 约 2 秒，自动重启进入配网模式。
+ESP32 (from `esp32/`):
 
----
-
-## 硬件要求
-
-| 项 | 要求 |
-|----|------|
-| 芯片 | ESP32（经典双核，如 ESP32-WROOM-32 / 32E / DevKit） |
-| 蓝牙 | **必须支持 Bluetooth Classic SPP**（ESP32-C3 等 BLE-only 芯片不适用） |
-| Flash | 4 MB（使用 `huge_app.csv` 分区表） |
-| 串口 | 波特率 2000000 |
-
-> 已验证目标为 4 MB、无 PSRAM 的 ESP32-WROOM；当前发布构建使用低内存 ESP-IDF 配置。
-
----
-
-## 依赖
-
-- [PlatformIO](https://platformio.org/)（推荐 VS Code 插件）
-- `framework = espidf, arduino`（ESP-IDF 4.4.x + Arduino 作为组件）
-- [bblanchon/ArduinoJson](https://github.com/bblanchon/ArduinoJson) ^7
-- [olikraus/U8g2](https://github.com/olikraus/u8g2) ^2.36
-
----
-
-## 编译与烧录
-
-```bash
-# 编译（4 MB WROOM 低内存 ESP-IDF 环境）
-pio run -e upesy_wroom_lowmem_idf
-
-# 烧录
-pio run -e upesy_wroom_lowmem_idf -t upload
-
-# 串口监视
-pio device monitor -b 2000000
+```powershell
+C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio run -e wroom_lowmem_idf
 ```
 
-> 首次编译若报 `sdkconfig` 相关错误，删除已生成的 `sdkconfig.wroom_lowmem_idf` 后重新 `pio run`。
+QuickApp (from `quickapp/`):
 
----
-
-## 首次配网
-
-1. 烧录后（无任何配置时），ESP32 自动开启热点 **`Vela-Bridge`**。
-2. 默认 AP 密码：**`hoshino-setup`**（第一次保存配置时建议改成你自己的）。
-3. 手机/电脑连接该热点。
-4. 浏览器打开 **`http://192.168.4.1/`**（连上热点后通常会自动弹出）。
-5. 扫描并选择家庭 Wi-Fi；扫描并选择附近的经典蓝牙设备；填写对应手表的 AuthKey（32 位 hex，仓库不含任何密钥）。
-6. 保存 → ESP32 自动重启 → 连家庭 Wi-Fi 并自动连接手表。
-
----
-
-## 正常工作流程
-
-配置保存后，每次开机都会：
-
-1. 连接家庭 Wi-Fi（STA）；
-2. 自动认证并连接手表（SDP 发现 SPP 通道）；
-3. 建立虚拟网卡 + NAPT；
-4. 手表获得 `10.1.10.2`、网关 `10.1.10.1`、DNS `114.114.114.114`；
-5. 手表的网络流量经 ESP32 转发上网。
-
-家庭 Wi-Fi 环境下，可用浏览器访问 `http://hoshino-bridge.local/`（mDNS）或 ESP32 的 STA IP 查看状态。
-
----
-
-## 重新配网（BOOT 长按）
-
-需要重新进入配网模式时：
-
-- 在设备正常运行后，**长按 `BOOT` 键约 2 秒**；
-- ESP32 写入标志并**重启**，重启后直接进入配网热点模式。
-
-> 不要在上电瞬间按住 BOOT，否则 ESP32 会进入下载模式。
-
-也可通过串口命令触发：
-
-```
-WATCH_SETUP
+```powershell
+npm install
+npm run build
 ```
 
-> 说明：配网模式采用「写标志 + 重启」而非运行时热切换，避免 STA→AP 切换因内存/状态问题失败。
-
----
-
-## Web API
-
-家庭 LAN 管理需带 Header `X-Hoshino-Token: <你的 token>`：
-
-```
-GET  /api/v1/status
-POST /api/v1/watch/start
-POST /api/v1/watch/stop
-POST /api/v1/context/reset
-POST /api/v1/chat
-POST /api/v1/test
-GET  /api/v1/models
-```
+Build outputs stay local and are ignored by the repository.
 
 配网 AP 专用：
 
