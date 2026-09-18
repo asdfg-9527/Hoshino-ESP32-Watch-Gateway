@@ -1,102 +1,205 @@
 # Hoshino Watch Gateway
 
-This repository contains the source for the Hoshino ESP32 gateway and its Xiaomi Vela QuickApp.
+Hoshino 是面向 Redmi Watch 6 / Xiaomi Vela QuickApp 的 ESP32 网络网关项目：手表通过 Bluetooth Classic SPP 与 ESP32 建立原有网络隧道，ESP32 再通过家庭 Wi-Fi 提供联网能力；QuickApp 通过手表侧 Interconnect 的 HTTP 请求完成状态读取、Wi-Fi 扫描和配网。
 
-## Layout
+本仓库只发布源码和文档，不发布固件、RPK、密钥或其他构建产物。
 
-- `esp32/` — current ESP32 gateway source, PlatformIO/ESP-IDF configuration, lwIP override, tests, and development notes.
-- `quickapp/` — current QuickApp source, manifest/package metadata, input method, and contract tests.
-- `archive/archive-Hoshino-ESP32-v2026.08.19-source-only.zip` — source-only snapshot of the previous remote version.
+## 项目来源与版本关系
 
-Firmware and package outputs are intentionally excluded from Git. This includes `.bin`, `.rpk`, `.elf`, `.map`, build directories, caches, signing material, and local secrets.
+本项目是在上一版公开项目 [xiazixua/esp32](https://github.com/xiazixua/esp32/) 的研究基础上继续整理和开发的 Hoshino ESP32 Watch Gateway。上一版项目公开了 `源码.zip` 与 `源码v31.zip`，其中的 README、硬件说明、PlatformIO 配置和网关思路均保留为本仓库的参考资料。
 
-## Build locally
+上一版仓库 README 中列出的功能模式包括：
 
-ESP32 (from `esp32/`):
+| 上游模式 | 说明 | 当前 Hoshino 源码状态 |
+|---|---|---|
+| 手表网关 | Bluetooth Classic SPP + Wi-Fi + NAPT，为手表提供联网桥接 | 当前主功能，保留并继续维护 |
+| BLE 广播 | 上游测试/研究模式 | 不包含在当前 source-only 快照 |
+| Wi-Fi 抓包 | 上游研究模式 | 不包含在当前 source-only 快照 |
+| 手环上网 | 上游已标记废弃的模式 | 不包含在当前 source-only 快照 |
+| 网络测速 | 上游测试模式 | 不包含在当前 source-only 快照 |
+| OTA | 上游版本曾使用 OTA 分区和回滚 | 当前版本不承诺 OTA；按当前 PlatformIO env 刷写 |
+
+上表用于保留上一版项目的说明，不代表当前仓库启用了这些历史模式。当前仓库的真实构建配置和路由以 `esp32/platformio.ini`、`esp32/src/main.cpp` 和 `quickapp/src/` 为准。
+
+## 当前功能
+
+- ESP32-WROOM / WROOM-32E 的 Bluetooth Classic SPP 手表连接与认证。
+- 原有 SPP、RFCOMM、虚拟网卡、DHCP、DNS、NAPT、TCP 转发和 Watch 网络隧道保持不变。
+- 手表侧虚拟网卡：手表通常获得 `10.1.10.2/24`，网关为 `10.1.10.1`。
+- 手表 IPv4 流量经 lwIP NAPT 转发到家庭 Wi-Fi。
+- 首次配置时开启 `Hoshino-Bridge` SoftAP，手机或电脑可以访问内置网页。
+- QuickApp 通过 `/watch-setup/status`、`/watch-setup/scan` 和 `/watch-setup/wifi` 完成手表端配网。
+- Wi-Fi 扫描最多保留 20 个唯一 SSID，同名网络保留较强 RSSI，响应包含 `rawCount` 和 `truncated`。
+- Wi-Fi 密码为空或少于 8 个字符时拒绝提交；连接失败会向手表返回明确错误，不会无限重试错误密码。
+- QuickApp 输入法为英文-only、rect QWERTY 版本，密码输入按当前 UI 要求显示明文。
+
+## 硬件要求
+
+| 项目 | 要求 |
+|---|---|
+| 芯片 | ESP32 经典双核，推荐 ESP32-WROOM-32 / 32E / DevKit |
+| 蓝牙 | 必须支持 Bluetooth Classic SPP；ESP32-C3 等 BLE-only 芯片不适用 |
+| Flash | 当前低内存环境使用 `bare_minimum_2MB.csv`，实际板卡应满足当前分区表容量 |
+| 串口 | 默认监视速率 2000000 baud |
+| 配网触发 | `GPIO16` 与 `GPIO17` 短接约 2 秒，或串口执行 `WATCH_SETUP` |
+
+上一版公开项目推荐 uPesy ESP32 WROOM、4MB Flash，并描述了 BOOT 键、板载 LED 和可选 SSD1306 OLED；这些内容是上游硬件参考，不是当前 Hoshino 版本的必需外设。
+
+## 目录结构
+
+```text
+.
+├── esp32/                         # 当前 ESP32 网关源码与 PlatformIO 配置
+│   ├── src/main.cpp               # 网关主程序
+│   ├── platformio.ini             # 构建环境
+│   ├── sdkconfig.wroom_lowmem_idf  # 低内存 ESP-IDF 配置
+│   ├── bare_minimum_2MB.csv       # 当前低内存分区表
+│   ├── lib/lwip_napt_override/    # NAPT 覆盖代码及 BSD 声明
+│   └── tests/tools/               # 合约测试与辅助工具
+├── quickapp/                      # Xiaomi Vela QuickApp 源码
+│   ├── src/pages/wifi_setup/      # 手表配网页面
+│   ├── src/common/esp32_bridge.js # HTTP/Interconnect 桥接
+│   └── src/components/InputMethod/# 精简英文键盘
+├── archive/                       # 上一版源码-only 快照
+├── LICENSE                        # PolyForm Noncommercial 1.0.0
+└── README.md
+```
+
+固件和包产物始终留在本地，不进入 Git，包括 `.bin`、`.rpk`、`.elf`、`.map`、`.pio/`、构建目录、缓存、签名材料和本地密钥。
+
+## 当前版本编译
+
+### ESP32
+
+在 `esp32/` 目录执行：
 
 ```powershell
 C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio run -e wroom_lowmem_idf
 ```
 
-QuickApp (from `quickapp/`):
+烧录仅在确认目标串口后执行：
+
+```powershell
+C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio run -e wroom_lowmem_idf -t upload
+```
+
+串口监视：
+
+```powershell
+C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio device monitor -b 2000000
+```
+
+当前 WROOM 低内存环境固定使用：`board = esp32dev`、`framework = espidf, arduino`、`bare_minimum_2MB.csv` 和 `sdkconfig.wroom_lowmem_idf`。不要擅自切换蓝牙、lwIP/NAPT 或分区配置。
+
+### QuickApp
+
+在 `quickapp/` 目录执行：
 
 ```powershell
 npm install
 npm run build
 ```
 
-Build outputs stay local and are ignored by the repository.
+构建生成的 RPK 只保存在本地并被 Git 忽略。
 
-配网 AP 专用：
+## 首次配网
 
+当前 Hoshino 固件的配网流程：
+
+1. ESP32 在无完整 Watch MAC/Auth Key 配置时开启 `Hoshino-Bridge` 热点。
+2. 默认 AP 密码为 `hoshino-setup`；首次保存后建议改为自己的密码。
+3. 手机或电脑连接该热点，打开 `http://192.168.4.1/`。
+4. 网页端可填写家庭 Wi-Fi、Watch MAC、32 位 Watch Auth Key、本地 Token 和 AP 密码。
+5. 手表端 QuickApp 通过 Interconnect 访问 `http://10.1.10.1`，读取状态、扫描 Wi-Fi 并提交配置。
+6. 配置保存成功后 ESP32 重启，连接家庭 Wi-Fi 并自动启动手表桥接。
+
+上一版 `xiazixua/esp32` 文档中的 `Vela-Bridge`、`12345678` 和 `upesy_wroom_lowmem_idf` 是其历史版本参数；当前 Hoshino 默认值以本节和 `esp32/src/main.cpp` 为准。
+
+## 正常工作流程
+
+```text
+Redmi Watch 6
+    │ Bluetooth Classic SPP / RFCOMM
+    ▼
+ESP32 Hoshino Gateway
+    ├─ 认证与 SPPv2 会话
+    ├─ 虚拟网卡 10.1.10.1/24
+    ├─ DHCP / DNS
+    ├─ lwIP NAPT
+    └─ 家庭 Wi-Fi → Internet
 ```
-POST /setup          # 保存配置（含 Wi-Fi / 手表参数）
-GET  /setup/status
-GET  /setup/trace
-GET  /setup/wifi/scan?start=1
-GET  /setup/bluetooth/scan?start=1
+
+建立桥接后，手表得到 `10.1.10.2`，默认网关为 `10.1.10.1`，DNS 由 ESP32 提供。配网扫描期间不应重构或替换原有 Bluetooth Classic 隧道。
+
+## Web API
+
+### 手机配网 AP
+
+```text
+GET  /                         # 内置配网页面
+POST /setup                    # 保存 Wi-Fi / Watch / AP 配置
+GET  /setup/status             # 当前配网状态
 ```
 
----
+### 手表侧配网隧道
+
+QuickApp 使用的基础地址为 `http://10.1.10.1`：
+
+```text
+GET  /watch-setup/status       # ESP32 与 Wi-Fi 状态
+GET  /watch-setup/scan         # 扫描附近 Wi-Fi
+POST /watch-setup/wifi         # 保存并连接指定 Wi-Fi
+```
+
+### 存储诊断
+
+```text
+GET /api/v1/storage/status
+GET /api/v1/storage/list
+GET /api/v1/storage/file
+GET /api/v1/storage/chunk
+```
+
+敏感配置接口只允许从 ESP32 配网 SoftAP 或已建立的受控手表隧道访问；仓库不包含任何真实 Auth Key、Wi-Fi 密码或 Token。
 
 ## 串口命令
 
 | 命令 | 作用 |
-|------|------|
+|---|---|
 | `WATCH_CONFIG ssid=.. wifi_pass=.. watch_mac=.. watch_auth=.. auto_connect=1` | 命令行保存配置 |
 | `WATCH_AUTH <MAC> <32hex>` | 手动触发认证/桥接 |
-| `WATCH_SETUP` | 进入配网模式（写标志 + 重启） |
+| `WATCH_SETUP` | 写入配网标志并重启 |
 | `WATCH_SDP <MAC>` | 查询 SPP 通道 |
 | `ESP_DNS_SELFTEST` | ESP32 独立 DNS 连通性自测 |
 
----
+## 上一版公开项目的历史说明
 
-## 架构概览
+上一版 `xiazixua/esp32` README 还介绍了以下内容：ESP32-WROOM 4MB 硬件、OLED/LED 状态显示、BLE 广播、Wi-Fi 抓包、网络测速、OTA 分区回滚，以及通过 `esptool.py` 写入 bootloader、分区表和固件。这些内容保留在本 README 作为项目历史和引用，但当前 source-only Hoshino 版本不包含那些历史模式的完整源码，也不随仓库发布任何 `.bin` 文件。
 
-```
-Redmi Watch 6
-   │  Bluetooth Classic SPP
-   ▼
-ESP32
-   ├─ 认证 / SPPv2 会话
-   ├─ 虚拟网卡 10.1.10.1/24（为手表提供 DHCP）
-   ├─ lwIP NAPT（IP 转发 + 源地址改写）
-   │
-   ├─ ch7 原始 IPv4 ──► NAPT ──► 家庭 Wi-Fi ──► 互联网
-   └─ 配网页面 ──► Wi-Fi / Bluetooth Classic 扫描 ──► AuthKey 配置
-```
+上一版公开项目的源码包使用 PlatformIO，核心构建框架为 `framework = espidf, arduino`，依赖包括 ArduinoJson、`sh123/esp32_opus` 和 U8g2；这些是技术栈信息，不是 AGPL 或其他开源许可证名称。
 
-> 注：本仓库未包含协议逆向抓包数据。若你需要在此基础上继续扩展，
-> 请自行遵守目标设备/服务的相关条款与当地法律法规。
+## 参考项目与致谢
 
----
+- [xiazixua/esp32](https://github.com/xiazixua/esp32/) — 上一版公开的 ESP32 Watch Gateway 项目。
+- [NEORUAA/Vela_input_method](https://github.com/NEORUAA/Vela_input_method) — QuickApp 输入法上游；当前仅保留英文 rect QWERTY 分支，见 `quickapp/src/components/InputMethod/UPSTREAM.md`。
+- AstroBox-NG — AstralSightStudios。
+- AstroBox-Public — AstralSightStudios。
+
+上一版公开项目 README 中列出的作者页面：
+
+- Bilibili：<https://m.bilibili.com/space/2132666053>
+- 酷安：<https://www.coolapk.com/u/21850863?from=qr>
+
+Hoshino 的 ESP32 固件实现基于设备通信行为、抓包和公开协议实现的研究。私有协议抓包数据不包含在本仓库中。
 
 ## 许可证
 
-- 本项目的原创代码以 **PolyForm Noncommercial License 1.0.0** 发布，见 [LICENSE](LICENSE)。未经原作者/版权持有人书面许可，不得将本项目、其修改版或基于本项目的衍生作品用于商业目的、商业产品、商业服务或商业分发。
-- 该许可证允许个人研究、实验、测试、爱好项目以及其他非商业用途；商业授权需另行取得原作者/版权持有人的书面许可。
-- `lib/lwip_napt_override/` 中的 `.inc` 文件源自 ESP-IDF 的 lwIP 实现，
-  保留其原始 **BSD** 许可声明；该第三方组件不受本项目原创代码许可替代。
-- `quickapp/src/components/InputMethod/` 中的输入法组件保留上游 **MIT** 许可证，
-  其版权和许可义务仍以该目录中的 `LICENSE` 为准。
-- 其他第三方代码及组件的许可证以对应源码目录中的声明为准。
-
----
+- 当前仓库原创代码使用 **PolyForm Noncommercial License 1.0.0**，见 [LICENSE](LICENSE)。未经原作者/版权持有人书面许可，不得将本项目、修改版或基于本项目的衍生作品用于商业目的、商业产品、商业服务或商业分发。
+- 原作者/版权持有人可以自行商业使用原创代码，或另行授予商业许可；第三方组件仍以其各自许可证为准。
+- `esp32/lib/lwip_napt_override/` 中的 lwIP 覆盖文件保留原始 **BSD** 许可声明。
+- `quickapp/src/components/InputMethod/` 保留上游 **MIT** 许可证。
+- 其他第三方代码和组件的许可证以对应源码目录中的声明为准。
 
 ## 免责声明
 
-本项目仅用于**个人学习与设备互联研究**。使用前请确认你拥有相关设备，
-并遵守设备制造商的服务条款与当地法律法规。作者不对任何误用、设备损坏或法律后果负责。
-
----
-
-## References & Acknowledgements
-
-本项目的 Xiaomi MiWear / Vela 穿戴设备通信协议研究过程中，
-参考并交叉验证了以下社区开源项目及公开资料：
-
-- AstroBox-NG — AstralSightStudios
-- AstroBox-Public — AstralSightStudios
-
-Hoshino 的 ESP32 固件实现基于对设备通信行为、抓包及公开协议实现的研究。
-第三方代码及组件的许可证以对应源码目录中的声明为准。
+本项目仅用于个人学习、设备互联研究和非商业用途。使用前请确认你拥有相关设备，并遵守设备制造商的服务条款与当地法律法规。作者不对任何误用、设备损坏或法律后果负责。
