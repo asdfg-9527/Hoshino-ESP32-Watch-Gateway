@@ -48,7 +48,7 @@ CONFIG_AUTOSTART_ARDUINO=y
 CONFIG_MBEDTLS_PSK_MODES=y
 
 # ---------- Flash: 2MB (actual board capacity) ----------
-CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # Arduino component requirement
 CONFIG_FREERTOS_HZ=1000
