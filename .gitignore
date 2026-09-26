@@ -38,3 +38,11 @@ signing.*
 .idea/
 .DS_Store
 Thumbs.db
+
+# ---- Local bring-up report and debug logs (not published) ----
+/BUILD_REPORT.md
+build_logs/
+**/build_logs/
+/quickapp/npm_install.log
+/quickapp/aiot_build.log
+/esp32/build_*.log

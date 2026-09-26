@@ -29,7 +29,7 @@
 | 芯片 | ESP32（经典双核，如 ESP32-WROOM-32 / 32E / DevKit） |
 | 蓝牙 | **必须支持 Bluetooth Classic SPP**（ESP32-C3 等 BLE-only 芯片不适用） |
 | Flash | ≥ 2 MB（默认使用 `bare_minimum_2MB.csv` 分区表） |
-| 串口 | 波特率 2000000 |
+| 串口 | 波特率 115200 |
 
 > 建议内存：项目已针对 2 MB Flash / 无 PSRAM 的 WROOM 做了内存优化，
 > 桥接稳定态空闲堆约 60~90 KB。若后续要跑更重的语音/TLS，可换 WROVER（8 MB PSRAM）。
@@ -55,7 +55,7 @@ pio run -e wroom_lowmem_idf
 pio run -e wroom_lowmem_idf -t upload
 
 # 串口监视
-pio device monitor -b 2000000
+pio device monitor -b 115200
 ```
 
 > 首次编译若报 `sdkconfig` 相关错误，删除已生成的 `sdkconfig.wroom_lowmem_idf` 后重新 `pio run`。

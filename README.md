@@ -32,6 +32,7 @@ Hoshino 是面向 Redmi Watch 6 / Xiaomi Vela QuickApp 的 ESP32 网络网关项
 - Wi-Fi 扫描最多保留 20 个唯一 SSID，同名网络保留较强 RSSI，响应包含 `rawCount` 和 `truncated`。
 - Wi-Fi 密码为空或少于 8 个字符时拒绝提交；连接失败会向手表返回明确错误，不会无限重试错误密码。
 - QuickApp 输入法为英文-only、rect QWERTY 版本，密码输入按当前 UI 要求显示明文。
+- 可选 0.96 寸 SSD1306 状态屏：实时显示本机 IP、家庭 Wi-Fi 状态、手表隧道状态、NAPT 转发计数和空闲堆。
 
 ## 硬件要求
 
@@ -40,22 +41,68 @@ Hoshino 是面向 Redmi Watch 6 / Xiaomi Vela QuickApp 的 ESP32 网络网关项
 | 芯片 | ESP32 经典双核，推荐 ESP32-WROOM-32 / 32E / DevKit |
 | 蓝牙 | 必须支持 Bluetooth Classic SPP；ESP32-C3 等 BLE-only 芯片不适用 |
 | Flash | 当前低内存环境使用 `bare_minimum_2MB.csv`，实际板卡应满足当前分区表容量 |
-| 串口 | 默认监视速率 2000000 baud |
+| 串口 | 默认监视速率 115200 baud |
 | 配网触发 | `GPIO16` 与 `GPIO17` 短接约 2 秒，或串口执行 `WATCH_SETUP` |
+| 状态屏（可选） | 0.96 寸 128x64 SSD1306，I2C 接 `GPIO21`(SDA) / `GPIO22`(SCL) |
 
 上一版公开项目推荐 uPesy ESP32 WROOM、4MB Flash，并描述了 BOOT 键、板载 LED 和可选 SSD1306 OLED；这些内容是上游硬件参考，不是当前 Hoshino 版本的必需外设。
+
+## 状态屏（0.96 寸 SSD1306）
+
+状态屏是**可选**功能，用于在没有手机/串口的情况下直接看板子当前状态。接线（模块必须支持 3.3V 逻辑）：
+
+| SSD1306 模块 | ESP32 |
+|---|---|
+| VCC | 3.3V |
+| GND | GND |
+| SDA | GPIO21 |
+| SCL | GPIO22 |
+
+`GPIO21` / `GPIO22` 是本固件里唯一空闲的常用引脚：`GPIO16`/`GPIO17` 被配网短接触发占用，`GPIO5`/`GPIO18`/`GPIO19`/`GPIO23` 被 SD 卡的 HSPI 占用。
+
+屏幕每 500 ms 刷新一次，5 行内容为：
+
+```text
+Hoshino GATEWAY      # 工作模式（SETUP = 配网模式）
+IP 192.168.1.123     # 本机地址；配网模式显示 SoftAP 的 192.168.4.1
+WIFI MyHomeWiFi      # 家庭 Wi-Fi：SSID / 失败原因（如 wrong_password）/ 连接中
+WATCH tunnel up      # 手表隧道状态（tunnel up / connected / connecting / idle）
+TX1234 RX5678 118K   # NAPT 转发计数与空闲堆
+```
+
+关于 `WATCH` 行的取值：
+
+- `tunnel up`：`gWatchNetworkReady`，虚拟网卡与 NAPT 已就绪，手表可以上网；
+- `connected` / `connecting` / `idle`：桥接任务状态，隧道尚未就绪；
+- `task FAIL`：桥接任务创建失败。
+
+关于第 5 行的计数：每行最多只能画 21 个字符（6px 等宽字体 × 21 = 126px）。计数超过 10000 后会压成紧凑形式（`12k`），超过 1000 万压成 `12M`，因此该行不会因为计数变长而挤掉堆的数字；万一仍然超宽，整段堆信息会被丢掉而不会把数字画到屏幕外。
+
+**实现约束（与项目低内存策略一致）**：全屏 framebuffer 仅 1024 字节；不开新任务、不做堆分配，所有文案都是栈上 `char[]` + `snprintf`；已配置的正常启动会把屏幕初始化**推迟到 Wi-Fi 就绪**，让蓝牙控制器和 `esp_wifi_init` 先拿到未被 `Wire` 切碎的堆（与 SD 卡惰性挂载同一思路）。配网模式没有经典蓝牙竞争内存，会立即点亮。
+
+排障：`initDisplay()` 会扫描整条 I2C 总线并把结果打到串口。常见日志：
+
+```text
+DISPLAY_I2C_SCAN sda=21 scl=22: 0x3C     # 找到设备
+DISPLAY_READY addr=0x3C refresh_ms=500
+DISPLAY_ADDR_OVERRIDE configured=0x3C using=0x3D   # 模块是 0x3D，自动兜底
+DISPLAY_INIT_FAILED no_i2c_device sda=21 scl=22    # 接线/供电问题，或根本没接屏幕
+```
+
+屏幕初始化失败只打串口日志，**不会**影响蓝牙桥接、NAPT 或配网。
 
 ## 目录结构
 
 ```text
 .
 ├── esp32/                         # 当前 ESP32 网关源码与 PlatformIO 配置
-│   ├── src/main.cpp               # 网关主程序
+│   ├── src/main.cpp               # 网关主程序（含可选 SSD1306 状态屏）
 │   ├── platformio.ini             # 构建环境
 │   ├── sdkconfig.wroom_lowmem_idf  # 低内存 ESP-IDF 配置
 │   ├── bare_minimum_2MB.csv       # 当前低内存分区表
 │   ├── lib/lwip_napt_override/    # NAPT 覆盖代码及 BSD 声明
-│   └── tests/tools/               # 合约测试与辅助工具
+│   ├── tools/                     # 辅助工具（如 Android 存储 mock）
+│   └── test_*.py                  # 合约测试（需在 esp32/ 目录下运行）
 ├── quickapp/                      # Xiaomi Vela QuickApp 源码
 │   ├── src/pages/wifi_setup/      # 手表配网页面
 │   ├── src/common/esp32_bridge.js # HTTP/Interconnect 桥接
@@ -86,10 +133,32 @@ C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio 
 串口监视：
 
 ```powershell
-C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio device monitor -b 2000000
+C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio device monitor -b 115200
 ```
 
 当前 WROOM 低内存环境固定使用：`board = esp32dev`、`framework = espidf, arduino`、`bare_minimum_2MB.csv` 和 `sdkconfig.wroom_lowmem_idf`。不要擅自切换蓝牙、lwIP/NAPT 或分区配置。
+
+#### 环境与状态屏开关
+
+状态屏由编译宏 `HOSHINO_ENABLE_DISPLAY` 控制（默认 `1`，可用 `-D` 覆盖）：
+
+| 环境 | 分区表 | 状态屏 |
+|---|---|---|
+| `esp32dev` | `huge_app.csv`（3MB app） | **开启** |
+| `esp32-wrover` | `huge_app.csv` | **开启** |
+| `wroom_lowmem_idf` | `bare_minimum_2MB.csv`（1900K app） | **关闭** |
+
+**为什么 2MB 环境默认关闭**：上一版带 OLED 的分支固件约 2.0MB，而 1900K 的 app 分区装不下它，因此低内存环境显式加了 `-DHOSHINO_ENABLE_DISPLAY=0`，让 U8g2 完全不参与链接，固件体积与该功能引入前保持一致。
+
+4MB 板要带状态屏，用 4MB 环境编译：
+
+```powershell
+C:\Users\liuya\AppData\Local\Programs\Python\Python312\python.exe -m platformio run -e esp32dev
+```
+
+如果要继续使用 `wroom_lowmem_idf` 的 ESP-IDF 低内存配置并同时点亮屏幕，需要把该环境的 `board_build.partitions` 改成 `huge_app.csv`（仅对 4MB 板）并把末尾的 `-DHOSHINO_ENABLE_DISPLAY=0` 改成 `=1`。
+
+刷新间隔可用 `-DHOSHINO_DISPLAY_REFRESH_MS=...` 调整（默认 500）。
 
 ### QuickApp
 

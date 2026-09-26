@@ -23,6 +23,20 @@
 #include <SPIFFS.h>
 #include <opus.h>
 #endif
+// 0.96" SSD1306 状态屏（U8g2 硬件 I2C）。在 flash 紧张的环境（例如
+// bare_minimum_2MB 分区表）可以用 -DHOSHINO_ENABLE_DISPLAY=0 整块编译掉，
+// 这样 U8g2 不会被链接，固件体积与该功能引入前保持一致。
+#ifndef HOSHINO_ENABLE_DISPLAY
+#define HOSHINO_ENABLE_DISPLAY 1
+#endif
+// 一次整屏推送要几十毫秒的 I2C 阻塞时间，状态屏不需要更高的刷新率。
+#ifndef HOSHINO_DISPLAY_REFRESH_MS
+#define HOSHINO_DISPLAY_REFRESH_MS 500
+#endif
+#if HOSHINO_ENABLE_DISPLAY
+#include <Wire.h>
+#include <U8g2lib.h>
+#endif
 #include <BluetoothSerial.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -5866,10 +5880,205 @@ void connectWifi() {
   // mDNS is started lazily from loop() after the Bluetooth bridge has
   // initialised, to keep heap available for the Bluetooth controller.
 }
+
+// ==================== 0.96" SSD1306 状态屏（I2C） ====================
+// I2C 接 GPIO21(SDA) / GPIO22(SCL)。这两个引脚在本固件里完全空闲：GPIO16/17 是
+// 配网短接触发，GPIO5/18/19/23 是 SD 卡的 HSPI。模块为 0.96 寸 128x64 SSD1306，
+// 地址通常是 0x3C（部分模块是 0x3D，下面的总线扫描会自动兜底）。
+//
+// 内存策略沿用本项目一贯做法：
+//   * 全屏 framebuffer 只有 1024 字节，对 WROOM 的堆影响可忽略；
+//   * 不开新任务、不做堆分配 —— 所有文案都是栈上 char[] + snprintf，唯一一次
+//     String 访问是读取已存在的 ssid，不做构造；
+//   * 已配置的正常启动把初始化推迟到 Wi-Fi 就绪，让蓝牙控制器与 esp_wifi_init
+//     先拿到没有被 Wire 切碎的堆（与 SD 卡惰性挂载同一个思路）。
+#if HOSHINO_ENABLE_DISPLAY
+constexpr int kOledSdaPin = 21;
+constexpr int kOledSclPin = 22;
+constexpr uint8_t kOledI2cAddr = 0x3C;
+constexpr uint32_t kDisplayRefreshMs = HOSHINO_DISPLAY_REFRESH_MS;
+// 6x10 字体的字宽步进正好是 6px，128px 一行放得下 21 个字符。
+constexpr uint8_t kDisplayLineChars = 21;
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, kOledSclPin, kOledSdaPin);
+bool gDisplayReady = false;
+bool gDisplayInitDeferred = false;
+uint32_t gLastDisplayMs = 0;
+
+// 按屏幕宽度截断，避免长 SSID 直接画到屏幕外。
+void displayDrawLine(int y, const char* text) {
+  char line[kDisplayLineChars + 1];
+  size_t index = 0;
+  while (index < kDisplayLineChars && text[index] != '\0') {
+    line[index] = text[index];
+    ++index;
+  }
+  line[index] = '\0';
+  display.drawStr(2, y, line);
 }
 
+// 把桥接状态压成适合屏幕的短文案；未知状态原样显示（本身已经比较短）。
+const char* displayStateLabel(const char* state) {
+  if (!state || !*state) return "idle";
+  if (strcmp(state, "connected") == 0) return "connected";
+  if (strcmp(state, "connecting") == 0 || strcmp(state, "starting") == 0) return "connecting";
+  if (strcmp(state, "stopping") == 0) return "stopping";
+  if (strcmp(state, "task_create_failed") == 0) return "task FAIL";
+  return state;
+}
+
+// 把 uint32 计数压成最多 5 个字符：<10000 原样显示，<1000 万加 k，再大加 M。
+// 第 5 行有 21 字符的硬上限，压过之后两个计数加标签最多 15 字符，永远放得下。
+void formatCompactCount(char* out, size_t capacity, uint32_t value) {
+  if (value < 10000UL) {
+    snprintf(out, capacity, "%lu", static_cast<unsigned long>(value));
+  } else if (value < 10000000UL) {
+    snprintf(out, capacity, "%luk", static_cast<unsigned long>(value / 1000UL));
+  } else {
+    snprintf(out, capacity, "%luM", static_cast<unsigned long>(value / 1000000UL));
+  }
+}
+
+// 渲染一帧。只在 loop() 里调用，display 对象不会被其它任务触碰，无需额外加锁。
+void renderDisplay() {
+  if (!gDisplayReady) return;
+
+  // gWatchBridgeState 由桥接任务在 gBridgeStateMutex 下改写，这里加锁快照，
+  // 避免把写了一半的字符串画到屏幕上。
+  char bridgeState[sizeof(gWatchBridgeState)]{};
+  if (gBridgeStateMutex && xSemaphoreTake(gBridgeStateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    memcpy(bridgeState, gWatchBridgeState, sizeof(bridgeState));
+    xSemaphoreGive(gBridgeStateMutex);
+  } else {
+    snprintf(bridgeState, sizeof(bridgeState), "%s", gWatchBridgeState);
+  }
+  bridgeState[sizeof(bridgeState) - 1] = '\0';
+
+  char wifiState[sizeof(gWifiState)]{};
+  snprintf(wifiState, sizeof(wifiState), "%s", gWifiState);
+  char wifiError[sizeof(gWifiError)]{};
+  snprintf(wifiError, sizeof(wifiError), "%s", gWifiError);
+
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tr);
+  char buf[48];
+
+  // 第 1 行：工作模式
+  snprintf(buf, sizeof(buf), "Hoshino %s", gSetupMode ? "SETUP" : "GATEWAY");
+  displayDrawLine(10, buf);
+
+  // 第 2 行：本机 IP —— 配网模式是 SoftAP 地址，正常模式是 STA 地址。
+  // 直接从 IPAddress 的 4 个字节格式化，不构造 String，避免在 BT 认证→Wi-Fi
+  // 启动这个堆最紧的窗口里反复申请/释放小块把堆切碎。
+  const IPAddress ip = gSetupMode ? WiFi.softAPIP()
+      : (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress(0, 0, 0, 0));
+  snprintf(buf, sizeof(buf), "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  displayDrawLine(22, buf);
+
+  // 第 3 行：家庭 Wi-Fi 状态（配网页 / SSID / 失败原因 / 连接中）
+  if (gSetupMode) {
+    snprintf(buf, sizeof(buf), "AP %s", kApSsid);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buf, sizeof(buf), "WIFI %s", ssid.c_str());
+  } else if (wifiError[0]) {
+    snprintf(buf, sizeof(buf), "WIFI %s", wifiError);
+  } else {
+    snprintf(buf, sizeof(buf), "WIFI %s", wifiState);
+  }
+  displayDrawLine(34, buf);
+
+  // 第 4 行：手表隧道状态
+  const char* watchLabel = "idle";
+  if (gWatchNetworkReady) watchLabel = "tunnel up";
+  else if (gWatchBridgeRunning) watchLabel = displayStateLabel(bridgeState);
+  snprintf(buf, sizeof(buf), "WATCH %s", watchLabel);
+  displayDrawLine(46, buf);
+
+  // 第 5 行：NAPT 转发计数与空闲堆。计数先压成紧凑形式（见 formatCompactCount），
+  // 保证在 21 字符上限内放得下；万一堆的数字把整行撑爆，就整段丢掉堆，
+  // 而绝不让数字被截断 —— 否则 "118K" 会显示成 "118"，变成误导读数。
+  char txText[8];
+  char rxText[8];
+  formatCompactCount(txText, sizeof(txText), gWatchNetworkTxPackets);
+  formatCompactCount(rxText, sizeof(rxText), gWatchNetworkRxPackets);
+  snprintf(buf, sizeof(buf), "TX%s RX%s %luK", txText, rxText,
+           static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
+  if (strlen(buf) > kDisplayLineChars) {
+    snprintf(buf, sizeof(buf), "TX%s RX%s", txText, rxText);
+  }
+  displayDrawLine(58, buf);
+
+  display.sendBuffer();
+}
+
+// 探测 I2C 总线并点亮屏幕。任何失败都只打串口日志，绝不影响桥接主流程。
+void initDisplay() {
+  Wire.begin(kOledSdaPin, kOledSclPin);
+
+  // 先扫一遍总线：模块没接好、地址是 0x3D、或者根本没供电，都能从串口直接区分，
+  // 不用拆机。地址就取扫到的第一个设备。
+  uint8_t detected = 0;
+  Serial.printf("DISPLAY_I2C_SCAN sda=%d scl=%d:", kOledSdaPin, kOledSclPin);
+  for (uint8_t address = 0x03; address <= 0x77; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", address);
+      if (detected == 0) detected = address;
+    }
+  }
+  Serial.println();
+
+  if (detected == 0) {
+    Serial.printf("DISPLAY_INIT_FAILED no_i2c_device sda=%d scl=%d\n", kOledSdaPin, kOledSclPin);
+    return;
+  }
+
+  uint8_t address = kOledI2cAddr;
+  if (detected != kOledI2cAddr) {
+    Serial.printf("DISPLAY_ADDR_OVERRIDE configured=0x%02X using=0x%02X\n", kOledI2cAddr, detected);
+    address = detected;
+  }
+
+  // U8g2 的 setI2CAddress 接收 8 位地址，而 I2C 扫描出来的是 7 位地址。
+  display.setI2CAddress(static_cast<uint8_t>(address << 1));
+  if (!display.begin()) {
+    Serial.printf("DISPLAY_INIT_FAILED no_ack addr=0x%02X\n", address);
+    return;
+  }
+
+  gDisplayReady = true;
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tr);
+  displayDrawLine(22, "Hoshino Gateway");
+  displayDrawLine(36, "display ready");
+  display.sendBuffer();
+  Serial.printf("DISPLAY_READY addr=0x%02X refresh_ms=%lu\n",
+                address, static_cast<unsigned long>(kDisplayRefreshMs));
+}
+
+// 正常启动时屏幕初始化被推迟到 Wi-Fi 就绪。配网模式永远不会连上 STA，所以必须把
+// gSetupMode / gSoftApActive 也算作就绪条件，否则 IO 短接触发的配网重启后屏幕
+// 永远不会点亮（上一版 OLED fork 在这里漏掉了配网分支）。
+void serviceDisplayInit() {
+  if (gDisplayReady || !gDisplayInitDeferred) return;
+  if (!gSetupMode && !gSoftApActive && WiFi.status() != WL_CONNECTED) return;
+  gDisplayInitDeferred = false;
+  initDisplay();
+}
+
+// 节流刷新：loop() 每轮只睡 2ms，而一次整屏 I2C 推送要几十毫秒，必须限速。
+void serviceDisplay() {
+  if (!gDisplayReady) return;
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - gLastDisplayMs) < static_cast<int32_t>(kDisplayRefreshMs)) return;
+  gLastDisplayMs = now;
+  renderDisplay();
+}
+#endif  // HOSHINO_ENABLE_DISPLAY
+}  // namespace
+
 void setup() {
-  Serial.begin(2000000);
+  Serial.begin(115200);
   WiFi.onEvent(handleWifiEvent);
   // Use the sdkconfig WiFi buffer counts (dynamic RX/TX = 8) instead of the
   // Arduino default hardcoded 32. Arduino's WiFiGeneric.cpp overrides the
@@ -5895,6 +6104,17 @@ void setup() {
   // beginWatchBluetooth() succeeds (see ensureScratchBuffers()).
   loadConfig();
   setupTriggerPins();
+#if HOSHINO_ENABLE_DISPLAY
+  // 显示屏与 Wire 会占用并切碎堆：已配置的正常启动推迟到 Wi-Fi 就绪后再初始化，
+  // 让蓝牙控制器与 esp_wifi_init 先拿到最干净的堆。缺少手表身份的首配启动没有
+  // 经典蓝牙竞争内存，可以立即点亮。
+  if (watchMac.length() != 17 || watchAuthKey.length() != 32) {
+    initDisplay();
+  } else {
+    gDisplayInitDeferred = true;
+    Serial.println("DISPLAY_INIT_DEFERRED until=wifi_or_setup_mode");
+  }
+#endif
   // 独立任务检测 GPIO 短接（不依赖被桥接阻塞的 loop()）。
   xTaskCreatePinnedToCore(setupTriggerTask, "hoshino_setup_trig", 2048, nullptr, 1, nullptr, 1);
   if (!gBridgeStateMutex) gBridgeStateMutex = xSemaphoreCreateMutex();
@@ -5940,6 +6160,12 @@ void setup() {
 
 void loop() {
   handleWatchProbeSerial();
+
+#if HOSHINO_ENABLE_DISPLAY
+  // 状态屏必须在 gSetupMode 的提前 return 之前刷新，否则配网模式下屏幕不更新。
+  serviceDisplayInit();
+  serviceDisplay();
+#endif
 
   // 配网模式：仅服务 AP 上的 HTTP 配置页面，不做桥接/重连。
   if (gSetupMode) {
