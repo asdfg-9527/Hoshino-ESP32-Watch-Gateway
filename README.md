@@ -10,6 +10,8 @@ Hoshino 是面向 Redmi Watch 6 / Xiaomi Vela QuickApp 的 ESP32 网络网关项
 
 上一版仓库 README 中列出的功能模式包括：
 
+本仓库的直接上游是 [Wanfeng-MI/Hoshino-ESP32-Watch-Gateway](https://github.com/Wanfeng-MI/Hoshino-ESP32-Watch-Gateway)，本分支基于其 `v2026.09.18-nc2` 快照，并在其基础上增加了 0.96 寸 SSD1306 状态屏、低内存 ESP-IDF 构建的蓝牙 ACL 上限修复，串口监视波特率改为 115200。
+
 | 上游模式 | 说明 | 当前 Hoshino 源码状态 |
 |---|---|---|
 | 手表网关 | Bluetooth Classic SPP + Wi-Fi + NAPT，为手表提供联网桥接 | 当前主功能，保留并继续维护 |
