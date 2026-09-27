@@ -5911,6 +5911,10 @@ constexpr uint8_t kDisplayPageLines = 3;
 constexpr int kDisplayPageY[kDisplayPageLines] = {16, 34, 52};
 constexpr uint32_t kDisplaySplashMs = 2000;
 constexpr uint32_t kDisplayPageMs = 5000;
+// 上电时没扫到屏就每 2 秒重试，最多 30 次（约 60 秒）。这样带电插屏、或者一边调线，
+// 只要总线一通屏幕就自动点亮，不用反复重启板子。
+constexpr uint8_t kDisplayScanRetries = 30;
+constexpr uint32_t kDisplayScanRetryMs = 2000;
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, kOledSclPin, kOledSdaPin);
 bool gDisplayReady = false;
@@ -5920,6 +5924,35 @@ uint32_t gDisplayReadyMs = 0;
 // 前几帧把每行像素宽度打到串口，这样没接实物屏也能核对版式有没有超宽。
 // 26 帧 × 500ms ≈ 13s，足够覆盖 2s 欢迎页 + A 页 5s + B 页 5s。
 uint8_t gDisplayLayoutLogFrames = 26;
+uint8_t gDisplayScanAttempts = 0;
+uint32_t gDisplayLastScanMs = 0;
+
+// I2C 空闲时 SDA/SCL 都应该是高电平（总线有上拉）。若某根读回 0，说明它被拉低 ——
+// 常见原因是 SDA/SCL 接反、线接错到 GND、或者模块把总线拉死了。这个日志能省掉大量猜测。
+void logI2cBusLevels(const char* tag) {
+  pinMode(kOledSdaPin, INPUT_PULLUP);
+  pinMode(kOledSclPin, INPUT_PULLUP);
+  delayMicroseconds(200);
+  const int sda = digitalRead(kOledSdaPin);
+  const int scl = digitalRead(kOledSclPin);
+  Serial.printf("DISPLAY_BUS %s sda=%d scl=%d  (1=正常空闲, 0=被拉低:接反/短路/未供电)\n",
+                tag, sda, scl);
+}
+
+// 扫一遍总线，返回第一个应答的地址（0 = 总线上没有任何设备）。
+uint8_t scanI2cBus() {
+  uint8_t first = 0;
+  Serial.printf("DISPLAY_I2C_SCAN sda=%d scl=%d:", kOledSdaPin, kOledSclPin);
+  for (uint8_t address = 0x03; address <= 0x77; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", address);
+      if (first == 0) first = address;
+    }
+  }
+  Serial.printf("  (device=%s)\n", first ? "found" : "NONE");
+  return first;
+}
 
 // 按“像素宽度”截断到屏幕内。line 必须是可写的 UTF-8 缓冲区，就地截断。
 void displayDrawLineUtf8(int y, char* line) {
@@ -6071,27 +6104,23 @@ void logDisplayLayoutPreview() {
   Serial.printf("DISPLAY_PREVIEW B3 w=%d %s\n", display.getUTF8Width(buf), buf);
 }
 
-// 探测 I2C 总线并点亮屏幕。任何失败都只打串口日志，绝不影响桥接主流程。
-void initDisplay() {
+// 探测 I2C 总线并点亮屏幕，成功返回 true。任何失败都只打串口日志，
+// 绝不影响桥接主流程；调用方会在超时前反复重试（见 serviceDisplayInit）。
+bool initDisplay() {
   Wire.begin(kOledSdaPin, kOledSclPin);
 
-  // 先扫一遍总线：模块没接好、地址是 0x3D、或者根本没供电，都能从串口直接区分，
-  // 不用拆机。地址就取扫到的第一个设备。
-  uint8_t detected = 0;
-  Serial.printf("DISPLAY_I2C_SCAN sda=%d scl=%d:", kOledSdaPin, kOledSclPin);
-  for (uint8_t address = 0x03; address <= 0x77; ++address) {
-    Wire.beginTransmission(address);
-    if (Wire.endTransmission() == 0) {
-      Serial.printf(" 0x%02X", address);
-      if (detected == 0) detected = address;
-    }
-  }
-  Serial.println();
+  logI2cBusLevels("before_scan");
+  // 扫一遍总线：没接好、地址是 0x3D、或者根本没供电，都能从串口直接区分，不用拆机。
+  const uint8_t detected = scanI2cBus();
 
   if (detected == 0) {
-    Serial.printf("DISPLAY_INIT_FAILED no_i2c_device sda=%d scl=%d\n", kOledSdaPin, kOledSclPin);
-    logDisplayLayoutPreview();
-    return;
+    const bool lastAttempt = gDisplayScanAttempts >= kDisplayScanRetries;
+    Serial.printf("DISPLAY_INIT_FAILED no_i2c_device attempt=%u/%u%s\n",
+                  static_cast<unsigned>(gDisplayScanAttempts),
+                  static_cast<unsigned>(kDisplayScanRetries),
+                  lastAttempt ? " giving_up" : " will_retry");
+    if (lastAttempt) logDisplayLayoutPreview();
+    return false;
   }
 
   uint8_t address = kOledI2cAddr;
@@ -6104,7 +6133,7 @@ void initDisplay() {
   display.setI2CAddress(static_cast<uint8_t>(address << 1));
   if (!display.begin()) {
     Serial.printf("DISPLAY_INIT_FAILED no_ack addr=0x%02X\n", address);
-    return;
+    return false;
   }
 
   gDisplayReady = true;
@@ -6115,23 +6144,40 @@ void initDisplay() {
   displayDrawCentered(40, "手表网络网关");
   displayDrawCentered(58, "By.晚安大风");
   display.sendBuffer();
-  Serial.printf("DISPLAY_READY addr=0x%02X refresh_ms=%lu font=wqy12\n",
-                address, static_cast<unsigned long>(kDisplayRefreshMs));
+  Serial.printf("DISPLAY_READY addr=0x%02X refresh_ms=%lu font=wqy12 attempts=%u\n",
+                address, static_cast<unsigned long>(kDisplayRefreshMs),
+                static_cast<unsigned>(gDisplayScanAttempts));
   Serial.printf("DISPLAY_LAYOUT splash_ms=%lu page_ms=%lu lines=%u max_w=%d\n",
                 static_cast<unsigned long>(kDisplaySplashMs),
                 static_cast<unsigned long>(kDisplayPageMs),
                 static_cast<unsigned>(kDisplayPageLines),
                 kDisplayRight - kDisplayLeft);
+  return true;
 }
 
 // 正常启动时屏幕初始化被推迟到 Wi-Fi 就绪。配网模式永远不会连上 STA，所以必须把
 // gSetupMode / gSoftApActive 也算作就绪条件，否则 IO 短接触发的配网重启后屏幕
 // 永远不会点亮（上一版 OLED fork 在这里漏掉了配网分支）。
+//
+// 首次没扫到屏时每 2 秒重试一次，最多 kDisplayScanRetries 次：接线是硬件调试里
+// 最容易反复折腾的一环，这样带电插屏/边调线就能看到屏幕亮起来，不用重启板子。
 void serviceDisplayInit() {
   if (gDisplayReady || !gDisplayInitDeferred) return;
   if (!gSetupMode && !gSoftApActive && WiFi.status() != WL_CONNECTED) return;
-  gDisplayInitDeferred = false;
-  initDisplay();
+
+  const uint32_t now = millis();
+  if (gDisplayScanAttempts > 0) {
+    if (gDisplayScanAttempts >= kDisplayScanRetries) {
+      gDisplayInitDeferred = false;  // 放弃，别再刷新占 loop()
+      return;
+    }
+    if (static_cast<int32_t>(now - gDisplayLastScanMs) < static_cast<int32_t>(kDisplayScanRetryMs)) {
+      return;
+    }
+  }
+  gDisplayLastScanMs = now;
+  ++gDisplayScanAttempts;
+  if (initDisplay()) gDisplayInitDeferred = false;
 }
 
 // 节流刷新：loop() 每轮只睡 2ms，而一次整屏 I2C 推送要几十毫秒，必须限速。
