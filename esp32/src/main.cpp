@@ -5897,62 +5897,58 @@ constexpr int kOledSdaPin = 21;
 constexpr int kOledSclPin = 22;
 constexpr uint8_t kOledI2cAddr = 0x3C;
 constexpr uint32_t kDisplayRefreshMs = HOSHINO_DISPLAY_REFRESH_MS;
-// 6x10 字体的字宽步进正好是 6px，128px 一行放得下 21 个字符。
-constexpr uint8_t kDisplayLineChars = 21;
+// ---- 版式：中文 12px 字库 ----
+// 改用 U8g2 的 wqy12（GB2312 子集，约 202KB flash），12px 字高、128x64 一屏最多 5 行。
+// 需要的 6 项信息放不下，所以拆成两页每 5 秒轮播，另外开机头 2 秒显示欢迎页（含签名）。
+// 中文一个字 3 字节，必须用 drawUTF8()，且截断要按像素宽度而不是字节数。
+//
+// 副机模式：计划用 UART(TX/RX) 接另一台 ESP32 做蓝牙音频（连耳机放音乐）。
+// 该链路目前还没实现，先固定显示“未启用”；做好后把 kSecondaryModeEnabled 换成真实状态即可。
+constexpr bool kSecondaryModeEnabled = false;
+constexpr int kDisplayLeft = 2;
+constexpr int kDisplayRight = 126;  // 右边留 2px
+constexpr uint8_t kDisplayPageLines = 3;
+constexpr int kDisplayPageY[kDisplayPageLines] = {16, 34, 52};
+constexpr uint32_t kDisplaySplashMs = 2000;
+constexpr uint32_t kDisplayPageMs = 5000;
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, kOledSclPin, kOledSdaPin);
 bool gDisplayReady = false;
 bool gDisplayInitDeferred = false;
 uint32_t gLastDisplayMs = 0;
+uint32_t gDisplayReadyMs = 0;
+// 前几帧把每行像素宽度打到串口，这样没接实物屏也能核对版式有没有超宽。
+// 26 帧 × 500ms ≈ 13s，足够覆盖 2s 欢迎页 + A 页 5s + B 页 5s。
+uint8_t gDisplayLayoutLogFrames = 26;
 
-// 按屏幕宽度截断，避免长 SSID 直接画到屏幕外。
-void displayDrawLine(int y, const char* text) {
-  char line[kDisplayLineChars + 1];
-  size_t index = 0;
-  while (index < kDisplayLineChars && text[index] != '\0') {
-    line[index] = text[index];
-    ++index;
+// 按“像素宽度”截断到屏幕内。line 必须是可写的 UTF-8 缓冲区，就地截断。
+void displayDrawLineUtf8(int y, char* line) {
+  size_t length = strlen(line);
+  while (length > 0 && display.getUTF8Width(line) > (kDisplayRight - kDisplayLeft)) {
+    do {
+      --length;
+    } while (length > 0 && (static_cast<uint8_t>(line[length]) & 0xC0) == 0x80);
+    line[length] = '\0';
   }
-  line[index] = '\0';
-  display.drawStr(2, y, line);
+  if (gDisplayLayoutLogFrames > 0) {
+    Serial.printf("DISPLAY_LINE y=%d w=%d %s\n", y, display.getUTF8Width(line), line);
+  }
+  display.drawUTF8(kDisplayLeft, y, line);
 }
 
-// 把桥接状态压成适合屏幕的短文案；未知状态原样显示（本身已经比较短）。
-const char* displayStateLabel(const char* state) {
-  if (!state || !*state) return "idle";
-  if (strcmp(state, "connected") == 0) return "connected";
-  if (strcmp(state, "connecting") == 0 || strcmp(state, "starting") == 0) return "connecting";
-  if (strcmp(state, "stopping") == 0) return "stopping";
-  if (strcmp(state, "task_create_failed") == 0) return "task FAIL";
-  return state;
-}
-
-// 把 uint32 计数压成最多 5 个字符：<10000 原样显示，<1000 万加 k，再大加 M。
-// 第 5 行有 21 字符的硬上限，压过之后两个计数加标签最多 15 字符，永远放得下。
-void formatCompactCount(char* out, size_t capacity, uint32_t value) {
-  if (value < 10000UL) {
-    snprintf(out, capacity, "%lu", static_cast<unsigned long>(value));
-  } else if (value < 10000000UL) {
-    snprintf(out, capacity, "%luk", static_cast<unsigned long>(value / 1000UL));
-  } else {
-    snprintf(out, capacity, "%luM", static_cast<unsigned long>(value / 1000000UL));
+// 居中绘制（欢迎页用）。
+void displayDrawCentered(int y, const char* text) {
+  int x = (128 - display.getUTF8Width(text)) / 2;
+  if (x < 0) x = 0;
+  if (gDisplayLayoutLogFrames > 0) {
+    Serial.printf("DISPLAY_LINE y=%d w=%d %s\n", y, display.getUTF8Width(text), text);
   }
+  display.drawUTF8(x, y, text);
 }
 
 // 渲染一帧。只在 loop() 里调用，display 对象不会被其它任务触碰，无需额外加锁。
 void renderDisplay() {
   if (!gDisplayReady) return;
-
-  // gWatchBridgeState 由桥接任务在 gBridgeStateMutex 下改写，这里加锁快照，
-  // 避免把写了一半的字符串画到屏幕上。
-  char bridgeState[sizeof(gWatchBridgeState)]{};
-  if (gBridgeStateMutex && xSemaphoreTake(gBridgeStateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    memcpy(bridgeState, gWatchBridgeState, sizeof(bridgeState));
-    xSemaphoreGive(gBridgeStateMutex);
-  } else {
-    snprintf(bridgeState, sizeof(bridgeState), "%s", gWatchBridgeState);
-  }
-  bridgeState[sizeof(bridgeState) - 1] = '\0';
 
   char wifiState[sizeof(gWifiState)]{};
   snprintf(wifiState, sizeof(wifiState), "%s", gWifiState);
@@ -5960,55 +5956,119 @@ void renderDisplay() {
   snprintf(wifiError, sizeof(wifiError), "%s", gWifiError);
 
   display.clearBuffer();
-  display.setFont(u8g2_font_6x10_tr);
-  char buf[48];
+  display.setFont(u8g2_font_wqy12_t_gb2312);
+  char buf[64];
 
-  // 第 1 行：工作模式
-  snprintf(buf, sizeof(buf), "Hoshino %s", gSetupMode ? "SETUP" : "GATEWAY");
-  displayDrawLine(10, buf);
+  const uint32_t uptime = millis() - gDisplayReadyMs;
 
-  // 第 2 行：本机 IP —— 配网模式是 SoftAP 地址，正常模式是 STA 地址。
-  // 直接从 IPAddress 的 4 个字节格式化，不构造 String，避免在 BT 认证→Wi-Fi
-  // 启动这个堆最紧的窗口里反复申请/释放小块把堆切碎。
-  const IPAddress ip = gSetupMode ? WiFi.softAPIP()
-      : (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress(0, 0, 0, 0));
-  snprintf(buf, sizeof(buf), "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-  displayDrawLine(22, buf);
+  // ① 欢迎页：开机头 2 秒，含签名。
+  if (uptime < kDisplaySplashMs) {
+    displayDrawCentered(22, "Hoshino Gateway");
+    displayDrawCentered(40, "手表网络网关");
+    displayDrawCentered(58, "By.晚安大风");
+    display.sendBuffer();
+    return;
+  }
 
-  // 第 3 行：家庭 Wi-Fi 状态（配网页 / SSID / 失败原因 / 连接中）
-  if (gSetupMode) {
-    snprintf(buf, sizeof(buf), "AP %s", kApSsid);
-  } else if (WiFi.status() == WL_CONNECTED) {
-    snprintf(buf, sizeof(buf), "WIFI %s", ssid.c_str());
-  } else if (wifiError[0]) {
-    snprintf(buf, sizeof(buf), "WIFI %s", wifiError);
+  // ② 状态页 A/B 每 5 秒轮播：A = WiFi / 密码 / IP，B = 强度 / 副机模式 / 手表 app 连接。
+  const uint32_t phase = (uptime - kDisplaySplashMs) % (kDisplayPageMs * 2u);
+
+  if (phase < kDisplayPageMs) {
+    // 第 1 行：家庭 Wi-Fi（配网模式显示热点名，失败显示原因）
+    if (gSetupMode) {
+      snprintf(buf, sizeof(buf), "WiFi：%s", kApSsid);
+    } else if (WiFi.status() == WL_CONNECTED) {
+      snprintf(buf, sizeof(buf), "WiFi：%s", ssid.c_str());
+    } else if (wifiError[0]) {
+      snprintf(buf, sizeof(buf), "WiFi：%s", wifiError);
+    } else {
+      snprintf(buf, sizeof(buf), "WiFi：%s", wifiState);
+    }
+    displayDrawLineUtf8(kDisplayPageY[0], buf);
+
+    // 第 2 行：配网热点密码（方便照着连 Hoshino-Bridge 配网）
+    snprintf(buf, sizeof(buf), "密码：%s", apPassword.c_str());
+    displayDrawLineUtf8(kDisplayPageY[1], buf);
+
+    // 第 3 行：本机 IP —— 直接从 IPAddress 的 4 个字节格式化，不构造 String，
+    // 避免在 BT 认证→Wi-Fi 启动这个堆最紧的窗口里反复申请小块。
+    const IPAddress ip = gSetupMode ? WiFi.softAPIP()
+        : (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress(0, 0, 0, 0));
+    snprintf(buf, sizeof(buf), "IP：%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    displayDrawLineUtf8(kDisplayPageY[2], buf);
   } else {
-    snprintf(buf, sizeof(buf), "WIFI %s", wifiState);
-  }
-  displayDrawLine(34, buf);
+    // 第 1 行：Wi-Fi 强度（dBm）+ 蓝牙连接状态。Classic 蓝牙只能读到相对 delta，
+    // 需要抢 Bluedroid 的 GAP 回调，风险大于收益，所以这里用连接状态表示。
+    const bool wifiUp = WiFi.status() == WL_CONNECTED;
+    char rssi[8];
+    if (wifiUp) {
+      snprintf(rssi, sizeof(rssi), "%d", static_cast<int>(WiFi.RSSI()));
+    } else {
+      snprintf(rssi, sizeof(rssi), "--");
+    }
+    snprintf(buf, sizeof(buf), "WIFI/蓝牙：%s %s", rssi, gWatchNetworkReady ? "已连" : "未连");
+    displayDrawLineUtf8(kDisplayPageY[0], buf);
 
-  // 第 4 行：手表隧道状态
-  const char* watchLabel = "idle";
-  if (gWatchNetworkReady) watchLabel = "tunnel up";
-  else if (gWatchBridgeRunning) watchLabel = displayStateLabel(bridgeState);
-  snprintf(buf, sizeof(buf), "WATCH %s", watchLabel);
-  displayDrawLine(46, buf);
+    // 第 2 行：副机模式（UART 接另一台 ESP32 做蓝牙音频，功能未实现 → 未启用）
+    snprintf(buf, sizeof(buf), "副机模式：%s", kSecondaryModeEnabled ? "已启用" : "未启用");
+    displayDrawLineUtf8(kDisplayPageY[1], buf);
 
-  // 第 5 行：NAPT 转发计数与空闲堆。计数先压成紧凑形式（见 formatCompactCount），
-  // 保证在 21 字符上限内放得下；万一堆的数字把整行撑爆，就整段丢掉堆，
-  // 而绝不让数字被截断 —— 否则 "118K" 会显示成 "118"，变成误导读数。
-  char txText[8];
-  char rxText[8];
-  formatCompactCount(txText, sizeof(txText), gWatchNetworkTxPackets);
-  formatCompactCount(rxText, sizeof(rxText), gWatchNetworkRxPackets);
-  snprintf(buf, sizeof(buf), "TX%s RX%s %luK", txText, rxText,
-           static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
-  if (strlen(buf) > kDisplayLineChars) {
-    snprintf(buf, sizeof(buf), "TX%s RX%s", txText, rxText);
+    // 第 3 行：手表 app 连接（等价于蓝牙隧道是否就绪）
+    const char* watchLabel = gWatchNetworkReady ? "已连接"
+        : (gWatchBridgeRunning ? "连接中" : "未连接");
+    snprintf(buf, sizeof(buf), "手表app连接：%s", watchLabel);
+    displayDrawLineUtf8(kDisplayPageY[2], buf);
   }
-  displayDrawLine(58, buf);
 
   display.sendBuffer();
+  if (gDisplayLayoutLogFrames > 0) --gDisplayLayoutLogFrames;
+}
+
+// 没接屏时，把“屏幕本来会显示什么”连同像素宽度打到串口。
+// getUTF8Width() 只依赖字库数据，不需要 display.begin()，所以这里可以直接用。
+void logDisplayLayoutPreview() {
+  display.setFont(u8g2_font_wqy12_t_gb2312);
+  Serial.printf("DISPLAY_PREVIEW max_w=%d\n", kDisplayRight - kDisplayLeft);
+
+  const char* splash[3] = {"Hoshino Gateway", "手表网络网关", "By.晚安大风"};
+  for (int i = 0; i < 3; ++i) {
+    Serial.printf("DISPLAY_PREVIEW splash%d w=%d %s\n", i, display.getUTF8Width(splash[i]), splash[i]);
+  }
+
+  char buf[64];
+  if (gSetupMode) {
+    snprintf(buf, sizeof(buf), "WiFi：%s", kApSsid);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buf, sizeof(buf), "WiFi：%s", ssid.c_str());
+  } else {
+    snprintf(buf, sizeof(buf), "WiFi：%s", gWifiState);
+  }
+  Serial.printf("DISPLAY_PREVIEW A1 w=%d %s\n", display.getUTF8Width(buf), buf);
+
+  snprintf(buf, sizeof(buf), "密码：%s", apPassword.c_str());
+  Serial.printf("DISPLAY_PREVIEW A2 w=%d %s\n", display.getUTF8Width(buf), buf);
+
+  const IPAddress previewIp = gSetupMode ? WiFi.softAPIP()
+      : (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress(0, 0, 0, 0));
+  snprintf(buf, sizeof(buf), "IP：%u.%u.%u.%u", previewIp[0], previewIp[1], previewIp[2], previewIp[3]);
+  Serial.printf("DISPLAY_PREVIEW A3 w=%d %s\n", display.getUTF8Width(buf), buf);
+
+  char rssi[8];
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(rssi, sizeof(rssi), "%d", static_cast<int>(WiFi.RSSI()));
+  } else {
+    snprintf(rssi, sizeof(rssi), "--");
+  }
+  snprintf(buf, sizeof(buf), "WIFI/蓝牙：%s %s", rssi, gWatchNetworkReady ? "已连" : "未连");
+  Serial.printf("DISPLAY_PREVIEW B1 w=%d %s\n", display.getUTF8Width(buf), buf);
+
+  snprintf(buf, sizeof(buf), "副机模式：%s", kSecondaryModeEnabled ? "已启用" : "未启用");
+  Serial.printf("DISPLAY_PREVIEW B2 w=%d %s\n", display.getUTF8Width(buf), buf);
+
+  const char* previewWatch = gWatchNetworkReady ? "已连接"
+      : (gWatchBridgeRunning ? "连接中" : "未连接");
+  snprintf(buf, sizeof(buf), "手表app连接：%s", previewWatch);
+  Serial.printf("DISPLAY_PREVIEW B3 w=%d %s\n", display.getUTF8Width(buf), buf);
 }
 
 // 探测 I2C 总线并点亮屏幕。任何失败都只打串口日志，绝不影响桥接主流程。
@@ -6030,6 +6090,7 @@ void initDisplay() {
 
   if (detected == 0) {
     Serial.printf("DISPLAY_INIT_FAILED no_i2c_device sda=%d scl=%d\n", kOledSdaPin, kOledSclPin);
+    logDisplayLayoutPreview();
     return;
   }
 
@@ -6047,13 +6108,20 @@ void initDisplay() {
   }
 
   gDisplayReady = true;
+  gDisplayReadyMs = millis();
   display.clearBuffer();
-  display.setFont(u8g2_font_6x10_tr);
-  displayDrawLine(22, "Hoshino Gateway");
-  displayDrawLine(36, "display ready");
+  display.setFont(u8g2_font_wqy12_t_gb2312);
+  displayDrawCentered(22, "Hoshino Gateway");
+  displayDrawCentered(40, "手表网络网关");
+  displayDrawCentered(58, "By.晚安大风");
   display.sendBuffer();
-  Serial.printf("DISPLAY_READY addr=0x%02X refresh_ms=%lu\n",
+  Serial.printf("DISPLAY_READY addr=0x%02X refresh_ms=%lu font=wqy12\n",
                 address, static_cast<unsigned long>(kDisplayRefreshMs));
+  Serial.printf("DISPLAY_LAYOUT splash_ms=%lu page_ms=%lu lines=%u max_w=%d\n",
+                static_cast<unsigned long>(kDisplaySplashMs),
+                static_cast<unsigned long>(kDisplayPageMs),
+                static_cast<unsigned>(kDisplayPageLines),
+                kDisplayRight - kDisplayLeft);
 }
 
 // 正常启动时屏幕初始化被推迟到 Wi-Fi 就绪。配网模式永远不会连上 STA，所以必须把
